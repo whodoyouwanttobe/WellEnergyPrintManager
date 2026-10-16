@@ -368,6 +368,15 @@ class PrintManagerApp(ctk.CTk):
             pass
         self.destroy()
 
+    def destroy(self):
+        # Останавливаем фоновые циклы (мониторинг принтеров), чтобы они не жили после окна
+        self._closing = True
+        try:
+            self.queue_manager.stop()
+        except Exception:
+            pass
+        super().destroy()
+
     def _open_bug_report(self):
         from ui.components.bug_report import BugReportDialog
         file = getattr(self, "current_selected_file", None)
@@ -378,7 +387,7 @@ class PrintManagerApp(ctk.CTk):
             import time
             import win32print
             
-            while True:
+            while not getattr(self, "_closing", False):
                 laser = getattr(self, '_current_laser', "Default Printer")
                 plotter = getattr(self, '_current_plotter', "Default Printer")
                 

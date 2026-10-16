@@ -43,7 +43,7 @@ function RunTests {
     & python -c "import pytest, pytest_timeout" 2>$null
     if ($LASTEXITCODE -ne 0) { & python -m pip install -q pytest pytest-timeout }
     Say "Тесты (окна программы откроются и закроются сами)..."
-    & python -m pytest -q
+    & python scripts/run_tests.py
     if ($LASTEXITCODE -ne 0) {
         if (-not (Yes (Ask "Тесты НЕ прошли. Всё равно отправить? (y/n)" "n"))) { Fail "отправка отменена из-за тестов" }
     } else { Say "Тесты пройдены" Green }
