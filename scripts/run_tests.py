@@ -15,10 +15,18 @@ import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
+# Консоль Windows (и GitHub Actions) по умолчанию в cp1252/cp866 — русский текст ронял скрипт.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+ENV = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+
 
 def run(args):
     print(">>> pytest " + " ".join(args), flush=True)
-    return subprocess.call([sys.executable, "-m", "pytest", *args], cwd=ROOT)
+    return subprocess.call([sys.executable, "-m", "pytest", *args], cwd=ROOT, env=ENV)
 
 
 def main():
@@ -27,7 +35,7 @@ def main():
         failed.append("обычные тесты")
 
     out = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", "gui"],
-                         cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                         cwd=ROOT, env=ENV, capture_output=True, text=True, encoding="utf-8", errors="replace")
     gui_tests = [ln.strip() for ln in out.stdout.splitlines() if "::" in ln]
     print(f"Оконных тестов: {len(gui_tests)} (каждый в отдельном процессе)", flush=True)
     for test_id in gui_tests:
