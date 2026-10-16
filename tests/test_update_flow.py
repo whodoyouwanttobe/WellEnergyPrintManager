@@ -78,3 +78,47 @@ def test_install_waits_for_print_queue(app, monkeypatch):
     assert app._update_state == "ready"
     pump(app, 7.0)                # 5 с паузы + 1.5 с перед установкой
     assert ("C:/tmp/new.exe", True) in installed and "closed" in installed
+
+
+@needs_display
+def test_print_progress_bar_and_status(app, tmp_path):
+    """Полоса печати появляется, статус файла «Печать…», «завершена» — только после всех заданий."""
+    from core.print_progress import PrintTracker
+    clock = {"t": 0.0}
+    app.print_tracker = PrintTracker(clock=lambda: clock["t"])
+    fp = str(tmp_path / "doc.pdf")
+    app.analyzed_data = {fp: {"pages": [(1, "A4", 210, 297, "1", False, False),
+                                        (2, "A1", 841, 594, "2", True, False)],
+                              "formats": {}, "total_pages": 2}}
+    app.file_tree.add_file(fp, "⏳")
+    jobs = []
+
+    class Job:
+        pass
+
+    def fake_add_job(filepath, printer_name, engine, settings, copies=1, pages=None, **kw):
+        j = Job()
+        j.filepath, j.pages, j.copies, j.format_name = filepath, pages, copies, kw.get("format_name")
+        jobs.append(j)
+        return j
+
+    app.queue_manager.add_job = fake_add_job
+    app._queue_job(fp, "HP MFP M436 PCL6", None, "", 1, [1], "A4", 100.0, 300)
+    app._queue_job(fp, "Canon TM-305", None, "", 1, [2], "A1", 100.0, 300)
+    for j in jobs:
+        app.on_print_start(j)
+    app._render_print_progress()
+    pump(app, 0.2)
+    status = app.file_tree.tree.item(app.file_tree._items[fp], "values")[3]
+    assert "Печать" in status
+    assert set(app.printer_bars) == {"HP MFP M436 PCL6", "Canon TM-305"}
+    assert "A4" in app.printer_bars["HP MFP M436 PCL6"][2].cget("text")
+
+    app.on_print_complete(jobs[0])            # очередь Windows отдала A4
+    assert "завершена" not in app.status_label.cget("text")
+    clock["t"] = 10_000                       # прошло больше любой оценки
+    app.print_tracker.spooled(jobs[1].tracker_id)
+    app._print_progress_loop()
+    pump(app, 0.2)
+    assert "завершена" in app.status_label.cget("text")
+    assert app.print_tracker.active_count(fp) == 0

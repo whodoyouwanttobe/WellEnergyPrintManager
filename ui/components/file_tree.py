@@ -74,7 +74,7 @@ class FileTreeView(ctk.CTkFrame):
         self.tree.bind("<Button-3>", self._on_right_click)
         
         self.context_menu = tk.Menu(self, tearoff=0, bg="#2b2b2b", fg="white", activebackground="#1f538d")
-        self.context_menu.add_command(label="Открыть файл (по умолчанию)", command=self._cmd_open_file)
+        self.context_menu.add_command(label="Открыть файл (программа по умолчанию)", command=self._cmd_open_file)
         self.context_menu.add_command(label="Открыть в Foxit", command=self._cmd_open_foxit)
         self.context_menu.add_command(label="Открыть папку", command=self._cmd_open_folder)
         self.context_menu.add_separator()
@@ -96,6 +96,15 @@ class FileTreeView(ctk.CTkFrame):
         if item:
             self.tree.selection_set(item)
             self._right_clicked_item = item
+            # Подпись первого пункта — какая программа реально открывает PDF в системе
+            # (берём каждый раз заново: пользователь мог сменить программу по умолчанию)
+            try:
+                from core.sysassoc import open_default_label
+                tags = self.tree.item(item, "tags")
+                ext = os.path.splitext(tags[0])[1] if tags else ".pdf"
+                self.context_menu.entryconfigure(0, label=open_default_label(ext or ".pdf"))
+            except Exception:
+                pass
             self.context_menu.post(event.x_root, event.y_root)
 
     def _cmd_open_file(self):

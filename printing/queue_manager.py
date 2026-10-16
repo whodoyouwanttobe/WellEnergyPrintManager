@@ -77,7 +77,8 @@ class PrintQueueManager:
         job = PrintJob(filepath, printer_name, engine, settings, copies, pages, format_name, scale, rasterize_dpi)
         self._ensure_thread(printer_name)
         self.queues[printer_name].put(job)
-        
+        return job
+
     def add_pause(self, printer_name, message, title="Внимание"):
         job = PauseJob(message, title)
         self._ensure_thread(printer_name)

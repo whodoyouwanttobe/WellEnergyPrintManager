@@ -12,7 +12,9 @@ from ui.components.dialog_utils import open_dialog
 from core.analyzer import ScanJob
 from core.analysis_cache import AnalysisCache
 from core.timefmt import short_time, long_time
-from core.print_time import estimate_plan, fmt_duration
+from core.print_time import (estimate_plan, fmt_duration, merged_profiles, detect_model,
+                             laser_job_seconds, plotter_job_seconds)
+from core.print_progress import PrintTracker
 from core.history import PrintHistory
 from core.pdf_utils import build_print_plan
 from ui.themes import apply_theme
@@ -98,6 +100,8 @@ class PrintManagerApp(ctk.CTk):
         self.queue_manager.on_job_start = lambda *a: self.ui_call(self.on_print_start, *a)
         self.queue_manager.on_job_complete = lambda *a: self.ui_call(self.on_print_complete, *a)
         self.queue_manager.on_job_error = lambda *a: self.ui_call(self.on_print_error, *a)
+        self.queue_manager.on_job_progress = lambda job, printed, total, size: self.ui_call(
+            self.print_tracker.progress, getattr(job, "tracker_id", None), printed, total)
         self.queue_manager.on_printer_alert = self._on_printer_alert
         self.queue_manager.on_pause_request = self._on_pause_request
         self.queue_manager.start()
@@ -111,6 +115,8 @@ class PrintManagerApp(ctk.CTk):
         self.total_print_jobs = 0
         self.completed_print_jobs = 0
         self.print_start_time = 0
+        self.print_tracker = PrintTracker()   # ход печати по принтерам (полосы прогресса)
+        self._had_print_activity = False
         
         self._file_times = {}   # печать в текущем сеансе: {fp: {"start": datetime, "end": datetime}}
         self._db_times = {}     # время из базы: {fp: {"print_first", "print_last", "fold_last"}}
@@ -635,6 +641,11 @@ class PrintManagerApp(ctk.CTk):
         self.overall_bar.set(0)
         
         self.printer_bars = {} # {printer_name: (label, bar)}
+        # Полосы хода печати по каждому принтеру (появляются только во время печати)
+        self.print_progress_frame = ctk.CTkFrame(self.progress_container, fg_color="transparent")
+        self.print_progress_frame.grid(row=1, column=0, sticky="ew")
+        self.print_progress_frame.columnconfigure(1, weight=1)
+        self.after(1000, self._print_progress_loop)
         
         # Row 2: Buttons
         btn_frame = ctk.CTkFrame(bottom_bar, fg_color="transparent")
@@ -870,8 +881,18 @@ class PrintManagerApp(ctk.CTk):
             session = self._file_times.get(fp)
             time_str = short_time(self._db_times.get(fp), session, fully_folded)
             time_tip = long_time(self._db_times.get(fp), session)
+            # Напечатана только часть страниц — помечаем, чтобы время не выглядело как «всё готово»
+            if time_str and not fully_folded and not time_str.startswith("▶") and 0 < done_cnt < total_needed:
+                time_str = "◐ " + time_str
+                time_tip = "Напечатана только часть страниц\n" + time_tip
 
-            if pc > 0 and folded_cnt >= total_needed:
+            active_jobs = self.print_tracker.active_count(fp)
+            pstate = self.print_tracker.file_state(fp)
+            if pstate == "printing":
+                status = f"🖨 Печать ({active_jobs})" if active_jobs > 1 else "🖨 Печать"
+            elif pstate == "queued":
+                status = "⏳ Ждёт печати"
+            elif pc > 0 and folded_cnt >= total_needed:
                 status = "Готово 🏁"
             elif pc > 0 and done_cnt >= total_needed:
                 status = "Напечатан ✅"
@@ -926,10 +947,6 @@ class PrintManagerApp(ctk.CTk):
                       f"Сшито: {total_folded_pages}/{total_pages_needed} | "
                       f"Общий прогресс (с учетом сложности): {overall_pct}%")
         
-        if self.total_print_jobs > 0 and self.completed_print_jobs < self.total_print_jobs:
-            self.overall_bar.set(self.completed_print_jobs / self.total_print_jobs)
-            batch_pct = int(self.completed_print_jobs / self.total_print_jobs * 100)
-            self.status_label.configure(text=f"Отправка заданий... ({batch_pct}%)", text_color="#f39c12")
         self.stats_label.configure(text=stats_text)
         
         # Yellow progress bar is overall complexity progress
@@ -937,11 +954,6 @@ class PrintManagerApp(ctk.CTk):
             self.overall_bar.set(overall_pct / 100.0)
         else:
             self.overall_bar.set(0)
-                
-            # Clear active printer bars when not printing
-            for widget in self.progress_container.winfo_children():
-                if widget != self.overall_bar:
-                    widget.destroy()
 
     def _reload_file_history(self, filepath):
         """Перечитать из базы отметки и время по одному файлу (после печати/отметки)."""
@@ -1124,7 +1136,7 @@ class PrintManagerApp(ctk.CTk):
                         if chunk_copies < 1: chunk_copies = 1 # fallback
                         
                         self.total_print_jobs += 1
-                        self.queue_manager.add_job(filepath, printer_name, engine, settings, copies=chunk_copies, pages=pages_list, format_name=fmt, scale=global_scale, rasterize_dpi=rasterize_dpi)
+                        self._queue_job(filepath, printer_name, engine, settings, chunk_copies, pages_list, fmt, global_scale, rasterize_dpi)
                         copies_sent += chunk_copies
                         
                         if copies_sent < copies:
@@ -1136,7 +1148,7 @@ class PrintManagerApp(ctk.CTk):
                         for i in range(0, len(pages_list), pages_per_chunk):
                             chunk = pages_list[i:i + pages_per_chunk]
                             self.total_print_jobs += 1
-                            self.queue_manager.add_job(filepath, printer_name, engine, settings, copies=1, pages=chunk, format_name=fmt, scale=global_scale, rasterize_dpi=rasterize_dpi)
+                            self._queue_job(filepath, printer_name, engine, settings, 1, chunk, fmt, global_scale, rasterize_dpi)
                             
                             # Add pause if this is not the very last chunk of the very last copy
                             is_last_chunk = (i + pages_per_chunk >= len(pages_list))
@@ -1145,14 +1157,104 @@ class PrintManagerApp(ctk.CTk):
                                 self.queue_manager.add_pause(printer_name, "Заберите напечатанные листы из лотка ПРИНТЕРА и нажмите ОК для продолжения.")
             else:
                 self.total_print_jobs += 1
-                self.queue_manager.add_job(filepath, printer_name, engine, settings, copies=copies, pages=pages_list, format_name=fmt, scale=global_scale, rasterize_dpi=rasterize_dpi)
+                self._queue_job(filepath, printer_name, engine, settings, copies, pages_list, fmt, global_scale, rasterize_dpi)
         else:
             printer_name = self.plotter_printer_var.get()
             settings = self.cfg.get("printers", {}).get("plotter", {}).get("settings", "")
             self.total_print_jobs += 1
-            self.queue_manager.add_job(filepath, printer_name, engine, settings, copies=copies, pages=pages_list, format_name=fmt, scale=global_scale, rasterize_dpi=rasterize_dpi)
+            self._queue_job(filepath, printer_name, engine, settings, copies, pages_list, fmt, global_scale, rasterize_dpi)
             
         self.queue_manager.start()
+
+    def _queue_job(self, filepath, printer_name, engine, settings, copies, pages, fmt, scale, dpi):
+        """Ставит задание в очередь печати и регистрирует его в трекере прогресса."""
+        from core.pdf_utils import is_laser
+        kind = "laser" if is_laser(fmt) else "plotter"
+        est = self._estimate_job_seconds(filepath, fmt, pages, copies, printer_name, kind)
+        job = self.queue_manager.add_job(filepath, printer_name, engine, settings, copies=copies, pages=pages,
+                                         format_name=fmt, scale=scale, rasterize_dpi=dpi)
+        if job is not None:
+            job.tracker_id = self.print_tracker.add(filepath, fmt, len(pages or []), copies,
+                                                    printer_name, kind, est)
+        self._had_print_activity = True
+        return job
+
+    def _estimate_job_seconds(self, filepath, fmt, pages, copies, printer_name, kind):
+        prof = merged_profiles(self.cfg.get("speed_profiles"))
+        over = float(prof["job_overhead_s"])
+        model = prof[kind][detect_model(kind, printer_name)]
+        if kind == "laser":
+            return laser_job_seconds(len(pages or []), fmt, copies, model, over)
+        data = self.analyzed_data.get(filepath, {})
+        sizes_by_page = {p[0]: (p[2], p[3]) for p in data.get("pages", [])}
+        sizes = [sizes_by_page.get(p, (594.0, 841.0)) for p in (pages or [])]
+        return plotter_job_seconds(sizes, copies, model, over)
+
+    def _print_progress_loop(self):
+        """Раз в секунду: обновить полосы печати; когда файл допечатан — отметить время окончания."""
+        try:
+            finished_files = self.print_tracker.tick()
+            if finished_files:
+                import datetime
+                now = datetime.datetime.now()
+                for fp in finished_files:
+                    self._file_times.setdefault(fp, {})["end"] = now
+                self._update_plan_and_ui()
+            self._render_print_progress()
+            self.print_tracker.clear_finished(older_than=15.0)
+        except Exception:
+            logging.error("Прогресс печати:\n%s", traceback.format_exc())
+        finally:
+            self.after(1000, self._print_progress_loop)
+
+    def _render_print_progress(self):
+        frame = self.print_progress_frame
+        printers = self.print_tracker.printers()
+        # убрать строки принтеров, которых больше нет
+        for name in list(self.printer_bars):
+            if name not in printers:
+                for w in self.printer_bars.pop(name):
+                    w.destroy()
+        busy_any = False
+        for row, name in enumerate(printers):
+            info = self.print_tracker.printer_summary(name)
+            if info is None:
+                continue
+            if name not in self.printer_bars:
+                lbl_name = ctk.CTkLabel(frame, text="", width=150, anchor="w", font=("Segoe UI", 11, "bold"))
+                bar = ctk.CTkProgressBar(frame, height=10, progress_color="#3498db")
+                lbl_info = ctk.CTkLabel(frame, text="", anchor="w", font=("Segoe UI", 11))
+                self.printer_bars[name] = (lbl_name, bar, lbl_info)
+            lbl_name, bar, lbl_info = self.printer_bars[name]
+            lbl_name.grid(row=row, column=0, sticky="w", padx=(0, 6))
+            bar.grid(row=row, column=1, sticky="ew", padx=(0, 8))
+            lbl_info.grid(row=row, column=2, sticky="w")
+            short = name if len(name) <= 22 else name[:21] + "…"
+            lbl_name.configure(text=f"🖨 {short}")
+            bar.set(info["fraction"])
+            if info["idle"]:
+                text = "✓ напечатано" + (f", ошибок: {info['errors']}" if info["errors"] else "")
+                bar.configure(progress_color="#2ecc71" if not info["errors"] else "#e67e22")
+            else:
+                busy_any = True
+                bar.configure(progress_color="#3498db")
+                cur = info["current"]
+                state = {"queued": "в очереди", "sending": "подготовка/отправка", "printing": "печать"}[cur["state"]]
+                text = (f"{state}: {cur['fmt']} — {cur['pages']} л. × {cur['copies']}  "
+                        f"({os.path.basename(cur['file'])[:28]})")
+                rest = []
+                if info["jobs_left"] > 1:
+                    fm = ", ".join(info["formats_left"][:4]) + ("…" if len(info["formats_left"]) > 4 else "")
+                    rest.append(f"ещё {info['jobs_left'] - 1} зад. ({fm})")
+                rest.append(f"осталось ≈{info['sheets_left']} л., {fmt_duration(info['seconds_left'])}")
+                text += "  |  " + ", ".join(rest)
+            lbl_info.configure(text=text)
+        if busy_any:
+            self.time_label.configure(text=f"Печать: осталось ≈{fmt_duration(max((self.print_tracker.printer_summary(p) or {}).get('seconds_left', 0) for p in printers))}")
+        elif self._had_print_activity and printers:
+            self._had_print_activity = False
+            self.time_label.configure(text="")
+            self.status_label.configure(text="Печать завершена ✓", text_color="#2ecc71")
 
     def _on_pause_request(self, pause_job):
         def show_msg():
@@ -1306,9 +1408,11 @@ class PrintManagerApp(ctk.CTk):
             
         if self.print_start_time == 0:
             self.print_start_time = time.time()
-        self.ui_call(lambda: self.file_tree.update_status(job.filepath, "Печать..."))
+        self.print_tracker.start(getattr(job, "tracker_id", None))
+        self._update_plan_and_ui()
         
     def on_print_error(self, job, error_msg):
+        self.print_tracker.error(getattr(job, "tracker_id", None))
         self.ui_call(lambda: messagebox.showerror("Ошибка печати", f"Ошибка при печати {os.path.basename(job.filepath)}:\n{error_msg}"))
         self.ui_call(lambda: self.file_tree.update_status(job.filepath, "Ошибка"))
         
@@ -1316,13 +1420,9 @@ class PrintManagerApp(ctk.CTk):
         import time
         import datetime
         fp = getattr(job, 'filepath', None)
-        if fp:
-            if not hasattr(self, '_file_times'):
-                self._file_times = {}
-            if fp not in self._file_times:
-                self._file_times[fp] = {}
-            self._file_times[fp]["end"] = datetime.datetime.now()
-            
+        # Очередь Windows отдала задание принтеру. Физически он ещё печатает — время окончания
+        # файла ставит _print_progress_loop, когда закончатся ВСЕ задания этого файла.
+        self.print_tracker.spooled(getattr(job, "tracker_id", None))
         self.completed_print_jobs += 1
         
         fmt = getattr(job, 'format_name', "Auto")
@@ -1353,19 +1453,4 @@ class PrintManagerApp(ctk.CTk):
         
         self._reload_file_history(job.filepath)
         
-        def update_ui():
-            self._update_plan_and_ui()
-            if self.total_print_jobs > 0:
-                elapsed = time.time() - self.print_start_time
-                if self.completed_print_jobs > 0:
-                    avg_time = elapsed / self.completed_print_jobs
-                    left_time = avg_time * (self.total_print_jobs - self.completed_print_jobs)
-                    mins = int(left_time // 60)
-                    secs = int(left_time % 60)
-                    self.time_label.configure(text=f"Ост: {mins}м {secs}с")
-                    
-                if self.completed_print_jobs >= self.total_print_jobs:
-                    self.status_label.configure(text="Печать завершена!")
-                    self.time_label.configure(text="")
-        
-        self.ui_call(update_ui)
+        self.ui_call(self._update_plan_and_ui)
