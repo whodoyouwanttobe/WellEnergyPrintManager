@@ -123,7 +123,11 @@ class PrintManagerApp(ctk.CTk):
         # Главное окно показываем СРАЗУ, а анализ идёт уже внутри него с прогрессом
         # и кнопкой «Отменить». Раньше окно было скрыто за заставкой до конца анализа,
         # и при выборе огромной/не той папки приходилось ждать.
-        self._close_splash()
+        # ВАЖНО: показывать окно только ПОСЛЕ запуска mainloop. CustomTkinter в Windows при
+        # старте mainloop прячет окно, если до этого вызывался withdraw() (а мы его вызываем,
+        # пока висит заставка) — в 4.9.0 окно из-за этого «пропадало» сразу после заставки,
+        # хотя программа продолжала работать в фоне.
+        self.after(100, self._close_splash)
         if self.current_folder and os.path.isdir(self.current_folder):
             self.after(300, self.start_analysis)
         elif self.current_folder:
@@ -136,8 +140,13 @@ class PrintManagerApp(ctk.CTk):
             except Exception:
                 pass
             self.splash = None
+        self._withdraw_called_before_window_exists = False  # флаг CustomTkinter, см. комментарий выше
         self.deiconify()
         self.lift()
+        try:
+            self.focus_force()
+        except Exception:
+            pass
     # ───────────── потокобезопасность и ошибки ─────────────
     def ui_call(self, fn, *args):
         """Можно вызывать из любого потока: fn(*args) выполнится в главном потоке Tk."""
@@ -201,12 +210,36 @@ class PrintManagerApp(ctk.CTk):
         threading.Thread(target=work, daemon=True).start()
 
     # ───────────── обновления ─────────────
-    def _check_updates_startup(self):
-        # Через 5 с после запуска, чтобы не мешать загрузке
-        self.after(5000, lambda: self.check_updates(manual=False))
-        self.after(8000, self._flush_reports_later)  # отчёты, не отправленные в прошлый раз
+    # ───────────── обновления ─────────────
+    # Логика:
+    #  • при запуске (первая проверка) и если не идёт печать — сразу окно с изменениями;
+    #  • позже (проверка раз в 30 мин) — только кнопка «⬆ Обновление x.y.z» в панели, без окон;
+    #  • если идёт печать — «Обновить после печати»: скачиваем сразу, а устанавливаем
+    #    и перезапускаемся автоматически, когда очередь печати опустеет.
+    UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000
 
-    def check_updates(self, manual=False, parent=None):
+    def _check_updates_startup(self):
+        self._update_info = None
+        self._update_state = None      # None / available / downloading / ready / scheduled
+        self._update_exe = None
+        self._update_after_print = False
+        self.after(3000, lambda: self.check_updates(startup=True))
+        self.after(8000, self._flush_reports_later)  # отчёты, не отправленные в прошлый раз
+        self.after(self.UPDATE_CHECK_INTERVAL_MS, self._periodic_update_check)
+        self.after(3000, self._update_watchdog)
+
+    def _periodic_update_check(self):
+        if self._update_state in (None, "available"):
+            self.check_updates()
+        self.after(self.UPDATE_CHECK_INTERVAL_MS, self._periodic_update_check)
+
+    def _print_busy_jobs(self):
+        try:
+            return self.queue_manager.pending_count()
+        except Exception:
+            return 0
+
+    def check_updates(self, manual=False, parent=None, startup=False):
         from core.updater import check_for_updates
         parent = parent or self
 
@@ -218,49 +251,115 @@ class PrintManagerApp(ctk.CTk):
             if manual:
                 self.ui_call(lambda: messagebox.showerror("Обновления", f"Не удалось проверить обновления:\n{msg}", parent=parent))
 
-        check_for_updates(lambda info: self.ui_call(self._offer_update, info, parent),
+        check_for_updates(lambda info: self.ui_call(self._on_update_found, info, startup, manual),
                           manual=manual, on_none=on_none, on_error=on_error)
 
-    def _offer_update(self, info, parent=None):
-        from core.version import FULL_VERSION
-        busy = self.total_print_jobs > 0 and self.completed_print_jobs < self.total_print_jobs
-        text = (f"Доступна версия {info['version']} (канал: {info['channel']}).\n"
-                f"Сейчас установлена: {FULL_VERSION}.\n\nИзменения:\n{info['changelog']}\n\n")
-        if busy:
-            text += "Идёт печать — обновление лучше установить после её окончания.\n\n"
-        if not messagebox.askyesno("Доступно обновление", text + "Скачать и установить сейчас?", parent=parent or self):
+    def _on_update_found(self, info, startup=False, manual=False):
+        if self._update_state in ("downloading", "ready", "scheduled"):
+            return  # уже занимаемся обновлением
+        self._update_info = info
+        self._update_state = "available"
+        self._show_update_button(f"⬆ Обновление {info['version'].lstrip('v')}")
+        # Окно — только сразу после запуска (и если не идёт печать) или по ручной проверке
+        if manual or (startup and self._print_busy_jobs() == 0):
+            self.show_update_dialog()
+
+    def _show_update_button(self, text, color="#e67e22"):
+        self.btn_update.configure(text=text, fg_color=color)
+        if not self.btn_update.winfo_ismapped():
+            self.btn_update.pack(side="left", padx=(10, 5), pady=5, after=self.btn_bug)
+
+    def show_update_dialog(self):
+        if not self._update_info:
             return
-        self.status_label.configure(text="Загрузка обновления... 0%", text_color="#3498db")
+        if self._update_state in ("downloading", "scheduled"):
+            messagebox.showinfo("Обновление", "Обновление уже загружается и установится автоматически "
+                                "после окончания печати.", parent=self)
+            return
+        from core.version import FULL_VERSION
+        from ui.components.update_dialog import UpdateDialog
+        open_dialog(self, "_update_dlg", lambda: UpdateDialog(
+            self, self._update_info, FULL_VERSION, self._print_busy_jobs(), self._on_update_choice))
+
+    def _on_update_choice(self, choice):
+        if choice == "later":
+            return
+        self._update_after_print = (choice == "after")
+        if self._update_state == "ready" and self._update_exe:
+            self._try_install()
+            return
+        self._download_update()
+
+    def _download_update(self):
+        info = self._update_info
+        self._update_state = "downloading"
+        self._show_update_button("⬇ Загрузка обновления 0%", "#3498db")
 
         def progress(frac):
-            self.ui_call(lambda: self.status_label.configure(text=f"Загрузка обновления... {int(frac * 100)}%"))
+            self.ui_call(lambda: self._show_update_button(f"⬇ Загрузка обновления {int(frac * 100)}%", "#3498db"))
 
         def worker():
             from core.updater import download_update
             try:
-                new_exe = download_update(info, progress)
-                self.ui_call(self._install_downloaded, new_exe)
+                exe = download_update(info, progress)
+                self.ui_call(self._on_update_downloaded, exe)
             except Exception as e:
                 logging.error(f"Загрузка обновления: {e}")
-                self.ui_call(lambda: (self.status_label.configure(text="Обновление не загружено", text_color="red"),
-                                      messagebox.showerror("Обновление", str(e), parent=self)))
+
+                def fail():
+                    self._update_state = "available"
+                    self._show_update_button(f"⬆ Обновление {info['version'].lstrip('v')}")
+                    messagebox.showerror("Обновление", f"Не удалось скачать обновление:\n{e}", parent=self)
+                self.ui_call(fail)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _install_downloaded(self, new_exe):
-        from core.updater import install_update
-        if not messagebox.askyesno("Обновление загружено", "Перезапустить программу и установить обновление?", parent=self):
-            self.status_label.configure(text="Установка обновления отложена")
+    def _on_update_downloaded(self, exe):
+        self._update_exe = exe
+        self._update_state = "ready"
+        self._try_install()
+
+    def _try_install(self):
+        """Устанавливаем сразу, если очередь печати пуста; иначе ждём её окончания."""
+        if self._print_busy_jobs() > 0:
+            self._update_state = "scheduled"
+            self._show_update_button("⏳ Обновится после печати", "#8e44ad")
+            self.status_label.configure(text="Обновление загружено — установится после окончания печати")
             return
+        self.status_label.configure(text="Установка обновления и перезапуск...", text_color="#3498db")
+        self.after(1500, self._install_now)
+
+    def _install_now(self):
+        from core.updater import install_update
         try:
-            install_update(new_exe)
+            install_update(self._update_exe, restart=True)
         except Exception as e:
             messagebox.showinfo("Обновление", str(e), parent=self)
+            self._update_state = "ready"
             return
+        self._update_state = "installing"
         self._on_close()
 
+    def _update_watchdog(self):
+        """Раз в 3 с: если обновление ждёт окончания печати и печать закончилась — ставим."""
+        try:
+            if self._update_state == "scheduled" and self._print_busy_jobs() == 0:
+                self.status_label.configure(text="Печать завершена — перезапуск для обновления через 5 с...",
+                                            text_color="#3498db")
+                self._update_state = "ready"
+                self.after(5000, self._try_install)
+        finally:
+            self.after(3000, self._update_watchdog)
+
     def _on_close(self):
-        """Корректное закрытие: останавливаем анализ (процессы-работники) и очередь печати."""
+        """Корректное закрытие: останавливаем анализ (процессы-работники) и очередь печати.
+        Если обновление скачано, но не установлено — ставим его без перезапуска."""
+        if getattr(self, "_update_state", None) in ("ready", "scheduled") and self._update_exe:
+            try:
+                from core.updater import install_update
+                install_update(self._update_exe, restart=False)
+            except Exception as e:
+                logging.info(f"Обновление при закрытии не установлено: {e}")
         try:
             if self._scan_job is not None:
                 self._scan_job.cancel()
@@ -362,6 +461,10 @@ class PrintManagerApp(ctk.CTk):
         
         btn_bug = ctk.CTkButton(toolbar, text="Сообщить об ошибке", fg_color="#b71c1c", hover_color="#d32f2f", command=self._open_bug_report)
         btn_bug.pack(side="left", padx=(20, 5), pady=5)
+        self.btn_bug = btn_bug
+        # Значок обновления — появляется, только когда есть новая версия
+        self.btn_update = ctk.CTkButton(toolbar, text="", fg_color="#e67e22", hover_color="#d35400",
+                                        command=self.show_update_dialog)
         
         btn_settings = ctk.CTkButton(toolbar, text="Настройки", command=self.open_settings)
         btn_settings.pack(side="right", padx=5, pady=5)

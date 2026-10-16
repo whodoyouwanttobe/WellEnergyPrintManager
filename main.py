@@ -55,6 +55,27 @@ if __name__ == "__main__":
         from ui.selftest import main_self_test
         sys.exit(main_self_test(sys.argv[1:]))
     
+    # Только один экземпляр: два одновременно запущенных WPM дважды анализируют папку
+    # и могут дважды отправить одно и то же на печать.
+    _instance_mutex = None
+    if sys.platform == "win32":
+        try:
+            _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            _instance_mutex = _k32.CreateMutexW(None, False, "Local\\WellEnergyPrintManager")
+            if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+                import tkinter as _tk
+                from tkinter import messagebox as _mb
+                _r = _tk.Tk(); _r.withdraw()
+                _mb.showwarning("WellEnergy Print Manager",
+                                "Программа уже запущена.\n\nЕсли её окна не видно — закройте WPM.exe "
+                                "в Диспетчере задач (Ctrl+Shift+Esc) и запустите снова.", parent=_r)
+                _r.destroy()
+                sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
+
     # Show splash before heavy imports
     splash = show_splash()
     
@@ -67,12 +88,35 @@ if __name__ == "__main__":
         logging.critical("Необработанное исключение:\n%s", "".join(traceback.format_exception(exc_type, exc, tb)))
     sys.excepthook = _log_unhandled
     threading.excepthook = lambda a: _log_unhandled(a.exc_type, a.exc_value, a.exc_traceback)
-    
-    # Import heavy modules
-    from ui.app import PrintManagerApp
-    
-    # Initialize the app with the splash screen
-    app = PrintManagerApp(splash=splash)
-    
-    # Start app loop. The splash will be destroyed by the app when ready.
-    app.mainloop()
+
+    # Падения на уровне C (Tk, PyMuPDF, драйвер принтера) не проходят через excepthook —
+    # faulthandler пишет для них трассировку в отдельный файл.
+    import faulthandler
+    _log_dir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WellEnergyPrintManager")
+    try:
+        _crash_file = open(os.path.join(_log_dir, "crash_native.log"), "a", encoding="utf-8")
+        _crash_file.write(f"\n--- запуск {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        _crash_file.flush()
+        faulthandler.enable(_crash_file, all_threads=True)
+    except OSError:
+        pass
+
+    try:
+        from core.version import FULL_VERSION
+        logging.info(f"Запуск WPM {FULL_VERSION}, exe: {sys.executable}")
+        from ui.app import PrintManagerApp
+        app = PrintManagerApp(splash=splash)
+        logging.info("Главное окно создано")
+        app.mainloop()
+        logging.info("Программа закрыта")
+    except Exception:
+        text = traceback.format_exc()
+        logging.critical("Программа не запустилась:\n%s", text)
+        try:
+            from tkinter import messagebox
+            messagebox.showerror("WPM — ошибка запуска",
+                                 "Программа не смогла запуститься.\n\n" + text[-1500:] +
+                                 f"\n\nЖурнал: {os.path.join(_log_dir, 'print_manager.log')}")
+        except Exception:
+            pass
+        sys.exit(1)

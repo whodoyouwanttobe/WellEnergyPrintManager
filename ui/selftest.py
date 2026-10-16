@@ -100,6 +100,37 @@ def run_self_test(work_dir):
     messagebox.askokcancel = lambda *a, **k: False
 
     from ui.app import PrintManagerApp
+
+    # 0. Окно видно после заставки (в 4.9.0 оно пряталось в Windows сразу после заставки)
+    try:
+        # В собранном exe main.py — это __main__ (импортировать его как "main" нельзя)
+        make_splash = getattr(sys.modules.get("__main__"), "show_splash", None)
+        if make_splash is None:
+            def make_splash():
+                sp = tk.Tk()
+                sp.overrideredirect(True)
+                sp.subtitle = tk.Label(sp, text="self-test")
+                sp.subtitle.pack()
+                sp.update()
+                return sp
+        splash = make_splash()
+        probe = PrintManagerApp(splash=splash)
+        seen = {}
+
+        def _probe_check():
+            seen["state"] = probe.state()
+            seen["viewable"] = probe.winfo_viewable()
+            probe.quit()
+
+        probe.after(1500, _probe_check)
+        probe.after(10000, probe.quit)  # страховка от зависания
+        probe.mainloop()
+        res.check(seen.get("state") == "normal" and seen.get("viewable") == 1,
+                  "главное окно видно после заставки", str(seen))
+        probe._on_close()
+    except Exception as e:
+        res.check(False, "главное окно видно после заставки", f"{type(e).__name__}: {e}")
+
     app = PrintManagerApp(splash=None)
     res.check(True, "главное окно создано")
 

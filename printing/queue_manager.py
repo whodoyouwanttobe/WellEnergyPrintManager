@@ -86,11 +86,25 @@ class PrintQueueManager:
         
     def clear(self):
         for q in self.queues.values():
-            while not q.empty():
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
+            self._drain(q)
+
+    @staticmethod
+    def _drain(q):
+        """Убрать все ожидающие задания, корректно уменьшив счётчик незавершённых
+        (иначе pending_count() навсегда считал бы очередь занятой)."""
+        with q.mutex:
+            n = len(q.queue)
+            q.queue.clear()
+            q.unfinished_tasks = max(0, q.unfinished_tasks - n)
+            if q.unfinished_tasks == 0:
+                q.all_tasks_done.notify_all()
+
+    def pending_count(self):
+        """Сколько заданий ещё в очереди или печатается прямо сейчас (по всем принтерам)."""
+        return sum(q.unfinished_tasks for q in list(self.queues.values()))
+
+    def is_busy(self):
+        return self.pending_count() > 0
 
     def _worker_loop(self, printer_name):
         q = self.queues[printer_name]
@@ -118,8 +132,7 @@ class PrintQueueManager:
                 job.event.wait()
                 
                 if job.cancelled:
-                    with q.mutex:
-                        q.queue.clear()
+                    self._drain(q)
                     logging.info(f"Queue for {printer_name} cancelled by user at pause prompt.")
                     
                 q.task_done()

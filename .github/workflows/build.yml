@@ -41,6 +41,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # нужна история и теги, чтобы собрать список изменений
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -93,13 +95,31 @@ jobs:
           $h = (Get-FileHash dist/WPM.exe -Algorithm SHA256).Hash.ToLower()
           "$h  WPM.exe" | Out-File -Encoding ascii dist/WPM.exe.sha256
 
+      - name: Список изменений (из сообщений коммитов с прошлого релиза этого канала)
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $ch = "${{ steps.ver.outputs.channel }}"
+          if ($ch -eq "stable") {
+            $prev = git tag --list "v*" --sort=-v:refname | Where-Object { $_ -notmatch "-" } | Select-Object -First 1
+          } else {
+            $prev = git tag --list "v*-$ch.*" --sort=-creatordate | Select-Object -First 1
+          }
+          $range = if ($prev) { "$prev..HEAD" } else { "HEAD" }
+          $log = git -c i18n.logOutputEncoding=UTF-8 log $range --no-merges --pretty="format:- %s" | Select-Object -First 40
+          if (-not $log) { $log = @("- Мелкие исправления") }
+          $text = ($log -join "`n")
+          if ($prev) { $text += "`n`n(изменения с $prev)" }
+          Set-Content -Path notes.md -Value $text -Encoding utf8
+          Get-Content notes.md
+
       - name: Публикация релиза
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ steps.ver.outputs.tag }}"
-          $flags = @("--target", "${{ github.sha }}", "--title", "WPM $tag", "--generate-notes")
+          $flags = @("--target", "${{ github.sha }}", "--title", "WPM $tag", "--notes-file", "notes.md")
           if ("${{ steps.ver.outputs.prerelease }}" -eq "true") { $flags += "--prerelease" } else { $flags += "--latest" }
           gh release create $tag dist/WPM.exe dist/WPM.exe.sha256 @flags
 

@@ -128,6 +128,16 @@ def _find_assets(release):
     return exe, sha
 
 
+def clean_changelog(body):
+    """Убирает служебные строки GitHub, оставляет список изменений."""
+    if not body:
+        return "Описание изменений не указано."
+    lines = [ln for ln in body.replace("\r", "").split("\n")
+             if not ln.strip().lower().startswith("**full changelog**")]
+    text = "\n".join(lines).strip()
+    return (text[:4000] + "\n…") if len(text) > 4000 else (text or "Описание изменений не указано.")
+
+
 def check_for_updates(callback, manual=False, on_none=None, on_error=None):
     """Проверка в фоне. callback(info) — если есть обновление.
     manual=True — проверять даже если автопроверка выключена."""
@@ -156,7 +166,7 @@ def check_for_updates(callback, manual=False, on_none=None, on_error=None):
                 return
             callback({
                 "version": rel.get("tag_name", ""),
-                "changelog": (rel.get("body") or "Нет описания изменений.")[:1500],
+                "changelog": clean_changelog(rel.get("body")),
                 "asset": exe,
                 "sha_asset": sha,
                 "channel": parse_tag(rel["tag_name"])[1],
@@ -233,8 +243,9 @@ def download_update(info, progress=None):
     return new_exe
 
 
-def install_update(new_exe):
-    """Заменяет текущий exe новым и перезапускает программу. Старый exe сохраняется как *.old."""
+def install_update(new_exe, restart=True):
+    """Заменяет текущий exe новым (после закрытия программы) и, если restart, запускает его.
+    Старый exe сохраняется как *.old."""
     current_exe = sys.executable
     if not getattr(sys, "frozen", False):
         raise RuntimeError(f"Программа запущена из исходников. Новый exe скачан сюда:\n{new_exe}")
@@ -254,7 +265,7 @@ if not errorlevel 1 goto ok
 set /a N+=1
 if %N% LSS 60 goto wait
 :ok
-start "" "%CUR%"
+{'start "" "%CUR%"' if restart else 'rem без перезапуска'}
 del "%~f0"
 """
     with open(bat_path, "w", encoding="utf-8") as f:

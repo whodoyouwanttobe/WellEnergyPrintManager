@@ -2,7 +2,7 @@
 # APP_VERSION меняете вы (в ветке dev, когда начинаете новую версию).
 # BUILD_CHANNEL и BUILD_NUMBER при сборке в GitHub Actions подставляются автоматически
 # (scripts/ci_set_version.py); при локальной сборке остаётся "local".
-APP_VERSION = "4.9.0"
+APP_VERSION = "4.9.1"
 BUILD_CHANNEL = "local"   # local / dev / beta / stable
 BUILD_NUMBER = 0
 
