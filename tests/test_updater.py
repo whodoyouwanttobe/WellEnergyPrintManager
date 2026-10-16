@@ -33,3 +33,22 @@ def test_stable_release_supersedes_beta():
     cur = ((4, 9, 1), "beta", 4)
     assert updater.pick_update([rel("v4.9.1")], "beta", cur)["tag_name"] == "v4.9.1"
     assert updater.pick_update([rel("v4.9.1-beta.3")], "beta", cur) is None
+
+
+def test_clean_child_env_removes_pyinstaller_vars(monkeypatch):
+    import sys
+    monkeypatch.setattr(sys, "_MEIPASS", r"C:\Temp\_MEI1234", raising=False)
+    env = {
+        "_PYI_APPLICATION_HOME_DIR": r"C:\Temp\_MEI1234",
+        "_PYI_ARCHIVE_FILE": r"C:\WPM\WPM.exe",
+        "_MEIPASS2": r"C:\Temp\_MEI1234",
+        "TCL_LIBRARY": r"C:\Temp\_MEI1234\tcl",
+        "SOME_TOOL": r"C:\Temp\_MEI1234\tools",
+        "PATH": r"C:\Temp\_MEI1234;C:\Windows",
+        "USERNAME": "User121",
+    }
+    out = updater.clean_child_env(env)
+    assert not any(k.startswith(("_PYI_", "_MEIPASS")) for k in out)
+    assert "TCL_LIBRARY" not in out and "SOME_TOOL" not in out
+    assert out["PATH"] == r"C:\Windows" and out["USERNAME"] == "User121"
+    assert out["PYINSTALLER_RESET_ENVIRONMENT"] == "1"

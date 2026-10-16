@@ -243,6 +243,26 @@ def download_update(info, progress=None):
     return new_exe
 
 
+_PYI_ENV_PREFIXES = ("_PYI_", "_MEIPASS")
+_PYI_ENV_NAMES = {"TCL_LIBRARY", "TK_LIBRARY", "TKPATH", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"}
+
+
+def clean_child_env(environ=None):
+    """Окружение для запуска НОВОГО независимого экземпляра программы."""
+    env = dict(os.environ if environ is None else environ)
+    meipass = getattr(sys, "_MEIPASS", None)
+    for key in list(env):
+        if key.upper().startswith(_PYI_ENV_PREFIXES) or key.upper() in _PYI_ENV_NAMES:
+            env.pop(key)
+        elif meipass and isinstance(env[key], str) and meipass in env[key] and key.upper() != "PATH":
+            env.pop(key)   # любые другие переменные, указывающие во временную папку старого exe
+    if meipass and "PATH" in env:
+        sep = ";" if (sys.platform == "win32" or ";" in env["PATH"]) else os.pathsep
+        env["PATH"] = sep.join(p for p in env["PATH"].split(sep) if meipass not in p)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"   # официальный флаг PyInstaller 6.9+
+    return env
+
+
 def install_update(new_exe, restart=True):
     """Заменяет текущий exe новым (после закрытия программы) и, если restart, запускает его.
     Старый exe сохраняется как *.old."""
@@ -270,8 +290,12 @@ del "%~f0"
 """
     with open(bat_path, "w", encoding="utf-8") as f:
         f.write(script)
+    # ВАЖНО: чистое окружение. Иначе перезапущенный exe наследует переменные PyInstaller
+    # (_PYI_*, _MEIPASS2, TCL_LIBRARY…) и думает, что он «дочерний процесс» старого exe:
+    # ищет python311.dll во временной папке старого процесса, которая уже удалена →
+    # «Failed to load Python DLL … _MEIxxxx\python311.dll».
     subprocess.Popen(["cmd", "/c", bat_path], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                     close_fds=True)
+                     close_fds=True, env=clean_child_env())
 
 
 # Совместимость со старым вызовом
