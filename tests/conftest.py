@@ -12,6 +12,7 @@ if ROOT not in sys.path:
 # APPDATA подменяется ДО первого импорта core.config.
 _TMP_APPDATA = tempfile.mkdtemp(prefix="wpm_tests_appdata_")
 os.environ["APPDATA"] = _TMP_APPDATA
+os.environ["WPM_NO_TOUR"] = "1"   # не предлагать обучение при создании окна в тестах
 
 
 @pytest.fixture

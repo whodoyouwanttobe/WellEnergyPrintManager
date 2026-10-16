@@ -111,10 +111,29 @@ def _settings():
     return repo, channel, token
 
 
+_ETAG_CACHE = {}   # url -> (etag, данные)
+
+
 def fetch_releases(repo, token=None, timeout=15):
+    """Список релизов. Повторные запросы — «условные» (If-None-Match): если ничего не
+    изменилось, GitHub отвечает 304 без тела, и такой ответ не тратит лимит запросов.
+    Поэтому программа может проверять обновления часто (раз в несколько минут)."""
     url = f"https://api.github.com/repos/{repo}/releases?per_page=50"
-    with urllib.request.urlopen(_request(url, token), timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    req = _request(url, token)
+    cached = _ETAG_CACHE.get((url, bool(token)))
+    if cached:
+        req.add_header("If-None-Match", cached[0])
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+            etag = r.headers.get("ETag")
+            if etag:
+                _ETAG_CACHE[(url, bool(token))] = (etag, data)
+            return data
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and cached:
+            return cached[1]
+        raise
 
 
 def _find_assets(release):

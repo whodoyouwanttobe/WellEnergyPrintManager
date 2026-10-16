@@ -22,6 +22,7 @@ if __name__ == '__main__':
         '--windowed',
         '--icon=ui/assets/icon.ico',
         '--add-data=ui/assets;ui/assets',
+        '--add-data=docs;docs',            # справка «?»
         '--hidden-import=win32timezone',
         '--collect-data=customtkinter',
     ]

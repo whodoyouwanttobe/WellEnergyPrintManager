@@ -1,7 +1,7 @@
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import ttk
-from core.pdf_utils import is_laser
+from core.pdf_utils import is_laser, is_heavy_page, page_ops, heavy_threshold, get_complexity_weight
 
 class ResultView(ctk.CTkFrame):
     def __init__(self, master, on_print_group=None, on_mark_group=None, 
@@ -66,13 +66,14 @@ class ResultView(ctk.CTkFrame):
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
         
-        self.detail_tree = ttk.Treeview(tree_frame, columns=("format", "width", "height", "orientation", "printer", "status"), style="Detail.Treeview")
+        self.detail_tree = ttk.Treeview(tree_frame, columns=("format", "width", "height", "orientation", "printer", "complexity", "status"), style="Detail.Treeview")
         self.detail_tree.heading("#0", text="Стр.")
         self.detail_tree.heading("format", text="Формат")
         self.detail_tree.heading("width", text="Ш (мм)")
         self.detail_tree.heading("height", text="В (мм)")
         self.detail_tree.heading("orientation", text="Ориентация")
         self.detail_tree.heading("printer", text="Принтер")
+        self.detail_tree.heading("complexity", text="Сложн.")
         self.detail_tree.heading("status", text="Статус")
         
         self.detail_tree.column("#0", width=50, anchor=tk.CENTER)
@@ -81,6 +82,7 @@ class ResultView(ctk.CTkFrame):
         self.detail_tree.column("height", width=80, anchor=tk.CENTER)
         self.detail_tree.column("orientation", width=100, anchor=tk.CENTER)
         self.detail_tree.column("printer", width=80, anchor=tk.CENTER)
+        self.detail_tree.column("complexity", width=80, anchor=tk.CENTER)
         self.detail_tree.column("status", width=100, anchor=tk.CENTER)
         
         self.detail_tree.grid(row=0, column=0, sticky="nsew")
@@ -91,6 +93,8 @@ class ResultView(ctk.CTkFrame):
         
         self.detail_tree.tag_configure("done", foreground="#2ecc71")
         self.detail_tree.tag_configure("warn", foreground="#f39c12")
+        self.detail_tree.tag_configure("printing", foreground="#5dade2")
+        self.detail_tree.tag_configure("heavy", foreground="#e59866")
 
     def clear(self):
         self.result_text.configure(state="normal")
@@ -154,7 +158,10 @@ class ResultView(ctk.CTkFrame):
             self._preview_window = None
             self._preview_photo = None
 
-    def display_results(self, filepath, info, grouped_formats, printed_dict, target_copies):
+    def display_results(self, filepath, info, grouped_formats, printed_dict, target_copies,
+                        printing_formats=(), printing_pages=()):
+        """printing_formats / printing_pages — что отправлено, но принтер ещё печатает:
+        для них не ставим «✔ Завершен», пока задание реально не закончится."""
         self.clear()
         self._right_clicked_filepath = filepath
         
@@ -165,28 +172,43 @@ class ResultView(ctk.CTkFrame):
             pd = printed_dict.get(p, 0)
             return pd.get("printed", 0) if isinstance(pd, dict) else pd
 
+        thr = heavy_threshold()
+        printing_formats = set(printing_formats or ())
+        printing_pages = set(printing_pages or ())
+
         # 1. Заполнение верхней сводки
         self.result_text.configure(state="normal")
         line_idx = 1
         for fmt, pages_str in grouped_formats.items():
             # Находим список страниц для этого формата
-            pages_list = [t[0] for t in info if t[1] == fmt]
-            lbls_list = [str(t[4]) if len(t) >= 5 else str(t[0]) for t in info if t[1] == fmt]
+            rows = [t for t in info if t[1] == fmt]
+            pages_list = [t[0] for t in rows]
+            lbls_list = [str(t[4]) if len(t) >= 5 else str(t[0]) for t in rows]
+            heavy_list = [t[0] for t in rows if is_heavy_page(t, thr)]
             has_logical = any(str(p) != str(l) for p, l in zip(pages_list, lbls_list))
             
-            self.result_text_map[line_idx] = (fmt, pages_str, pages_list, lbls_list, has_logical)
+            self.result_text_map[line_idx] = (fmt, pages_str, pages_list, lbls_list, has_logical, heavy_list)
             dest = "HP" if is_laser(fmt) else "Canon"
             
             # Подсчет напечатанных копий
             done_cnt = sum(min(_get_printed_c(p), target_copies) for p in pages_list)
             total_needed = len(pages_list) * target_copies
-            status = "✔ Завершен" if done_cnt >= total_needed and total_needed > 0 else f"{done_cnt}/{total_needed} расп."
+            if fmt in printing_formats:
+                status = f"🖨 печатается, {done_cnt}/{total_needed}"
+            elif done_cnt >= total_needed and total_needed > 0:
+                status = "✔ Завершен"
+            else:
+                status = f"{done_cnt}/{total_needed} расп."
             
-            from core.pdf_utils import get_complexity_weight
-            weight = get_complexity_weight(fmt)
-            warning_text = " ⚠ Тяжёлые страницы — будет применена растеризация (ускоренная отправка)" if weight >= 12 else ""
+            notes = ""
+            if heavy_list:
+                notes += f"  ⚡ тяжёлые: стр. {self._compress_page_ranges(heavy_list)}"
+                if not is_laser(fmt):
+                    notes += " (растеризация при печати)"
+            elif get_complexity_weight(fmt) >= 12:
+                notes += "  ⚠ большой формат — растеризация при печати"
             
-            self.result_text.insert("end", f"[{dest}] {fmt}  {pages_str}  ({status}){warning_text}\n")
+            self.result_text.insert("end", f"[{dest}] {fmt}  {pages_str}  ({status}){notes}\n")
             line_idx += 1
             
         self.result_text.configure(state="disabled")
@@ -217,33 +239,43 @@ class ResultView(ctk.CTkFrame):
             dest = "HP" if is_laser(fmt) else "Canon"
             
             printed_copies = _get_printed_c(pn)
-            tag = "done" if printed_copies >= target_copies else ""
+            heavy = is_heavy_page(info_tuple, thr)
+            tag = "done" if printed_copies >= target_copies else ("heavy" if heavy else "")
+            status = f"{printed_copies}/{target_copies}"
+            if pn in printing_pages:
+                tag, status = "printing", "🖨 печать"
             
             # Extract new tuple fields with safe fallbacks
             is_black = info_tuple[6] if len(info_tuple) >= 7 else False
             warning = " (реком. Foxit)" if is_black and is_laser(fmt) else ""
-            if is_black and is_laser(fmt) and tag != "done":
+            if is_black and is_laser(fmt) and tag not in ("done", "printing"):
                 tag = "warn"
             
             # Show logical label in parentheses next to physical page if they differ
             display_pn = str(pn) if str(pn) == str(lbl) else f"{pn} ({lbl})"
-            
-            from core.pdf_utils import get_complexity_weight
-            weight = get_complexity_weight(fmt)
-            complexity_warn = " ⚠ Тяжёлая страница — растеризация при печати" if weight >= 12 else ""
+            ops = page_ops(info_tuple)
+            complexity = (f"⚡ {ops // 1000} тыс." if heavy else f"{ops // 1000} тыс.") if ops else "—"
             
             self.detail_tree.insert("", "end", text=display_pn,
-                                    values=(f"{display_fmt}{warning}{complexity_warn}", f"{w:.0f}", f"{h:.0f}", o, dest, f"{printed_copies}/{target_copies}"),
+                                    values=(f"{display_fmt}{warning}", f"{w:.0f}", f"{h:.0f}", o, dest,
+                                            complexity, status),
                                     tags=(tag,))
 
     def _on_result_text_right_click(self, event):
         index = self.result_text.index(f"@{event.x},{event.y}")
         line_idx = int(index.split('.')[0])
         if line_idx in self.result_text_map:
-            self._right_clicked_fmt, _, self._right_clicked_pages, self._right_clicked_lbls, has_logical = self.result_text_map[line_idx]
+            (self._right_clicked_fmt, _, self._right_clicked_pages, self._right_clicked_lbls,
+             has_logical, heavy_list) = self.result_text_map[line_idx]
             
             self.format_menu.delete(0, "end")
             self.format_menu.add_command(label="Печать группы", command=self._cmd_print_group)
+            if heavy_list and len(heavy_list) < len(self._right_clicked_pages):
+                light = [p for p in self._right_clicked_pages if p not in set(heavy_list)]
+                self.format_menu.add_command(label=f"Печать только ⚡ тяжёлых ({len(heavy_list)} стр.)",
+                                             command=lambda hl=heavy_list: self._cmd_print_subset(hl))
+                self.format_menu.add_command(label=f"Печать без тяжёлых ({len(light)} стр.)",
+                                             command=lambda lp=light: self._cmd_print_subset(lp))
             
             if has_logical:
                 self.format_menu.add_command(label="Скопировать страницы (физические)", command=lambda: self._cmd_copy_pages(logical=False))
@@ -260,6 +292,10 @@ class ResultView(ctk.CTkFrame):
         if self.on_print_group and self._right_clicked_fmt:
             self.on_print_group(self._right_clicked_filepath, self._right_clicked_fmt, self._right_clicked_pages)
             
+    def _cmd_print_subset(self, pages):
+        if self.on_print_group and self._right_clicked_fmt and pages:
+            self.on_print_group(self._right_clicked_filepath, self._right_clicked_fmt, list(pages))
+
     def _cmd_copy_pages(self, logical=False):
         pages = self._right_clicked_lbls if logical else self._right_clicked_pages
         if pages:

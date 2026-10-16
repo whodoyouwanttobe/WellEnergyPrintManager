@@ -109,7 +109,7 @@ def test_print_progress_bar_and_status(app, tmp_path):
         app.on_print_start(j)
     app._render_print_progress()
     pump(app, 0.2)
-    status = app.file_tree.tree.item(app.file_tree._items[fp], "values")[3]
+    status = app.file_tree.tree.item(app.file_tree._items[fp], "values")[4]
     assert "Печать" in status
     assert set(app.printer_bars) == {"HP MFP M436 PCL6", "Canon TM-305"}
     assert "A4" in app.printer_bars["HP MFP M436 PCL6"][2].cget("text")

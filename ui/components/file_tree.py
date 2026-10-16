@@ -37,17 +37,19 @@ class FileTreeView(ctk.CTkFrame):
 
         # Колонки: имя | страниц | сшито | статус | время.
         # Разбивка по форматам показывается подсказкой при наведении на «Стр.»
-        self.tree = ttk.Treeview(self, columns=("name", "pages", "folded", "status", "time"),
+        self.tree = ttk.Treeview(self, columns=("name", "pages", "printed", "folded", "status", "time"),
                                  show="tree headings", style="Treeview")
         self.tree.heading("#0", text="")
         self.tree.heading("name", text="Файл", anchor="w")
         self.tree.heading("pages", text="Стр.")
+        self.tree.heading("printed", text="Напеч.")
         self.tree.heading("folded", text="Сшито")
         self.tree.heading("status", text="Статус")
         self.tree.heading("time", text="Время")
         self.tree.column("#0", width=22, minwidth=22, stretch=False)
         self.tree.column("name", width=300, anchor="w")
         self.tree.column("pages", width=48, minwidth=40, anchor="center", stretch=False)
+        self.tree.column("printed", width=64, minwidth=50, anchor="center", stretch=False)
         self.tree.column("folded", width=64, minwidth=50, anchor="center", stretch=False)
         self.tree.column("status", width=130, anchor="center")
         self.tree.column("time", width=120, anchor="center")
@@ -238,7 +240,7 @@ class FileTreeView(ctk.CTkFrame):
             current_path = os.path.join(current_path, part)
             node_id = f"dir_{current_path}"
             if not self.tree.exists(node_id):
-                self.tree.insert(parent, "end", node_id, text="", values=(f"📁 {part}", "", "", "", ""), open=True)
+                self.tree.insert(parent, "end", node_id, text="", values=(f"📁 {part}", "", "", "", "", ""), open=True)
             parent = node_id
             
         # Insert file
@@ -247,10 +249,10 @@ class FileTreeView(ctk.CTkFrame):
         if filepath in self._items and self.tree.exists(self._items[filepath]):
             return
         filename = parts[-1]
-        self._items[filepath] = self.tree.insert(parent, "end", values=(filename, "", "", status, ""), tags=(filepath,))
+        self._items[filepath] = self.tree.insert(parent, "end", values=(filename, "", "", "", status, ""), tags=(filepath,))
 
     def update_status(self, filepath, new_status, info_text="", pages=None, formats=None,
-                      folded=None, time_str=None, time_tip=None):
+                      folded=None, time_str=None, time_tip=None, printed=None, printed_tip=None):
         """pages — число страниц, formats — список строк вида 'A4 (12)' для подсказки,
         folded — текст '3/10', time_str — текст для колонки «Время».
         Не переданные значения сохраняются с прошлого вызова."""
@@ -261,6 +263,10 @@ class FileTreeView(ctk.CTkFrame):
             meta["formats"] = list(formats)
         if folded is not None:
             meta["folded"] = folded
+        if printed is not None:
+            meta["printed"] = printed
+        if printed_tip is not None:
+            meta["printed_tip"] = list(printed_tip)
         if time_tip is not None:
             meta["time_tip"] = time_tip
         if time_str is not None:
@@ -300,6 +306,7 @@ class FileTreeView(ctk.CTkFrame):
 
         values = (os.path.basename(filepath),
                   meta.get("pages", ""),
+                  meta.get("printed", ""),
                   meta.get("folded", ""),
                   new_status,
                   meta.get("time", ""))
@@ -312,13 +319,18 @@ class FileTreeView(ctk.CTkFrame):
     def _on_motion(self, event):
         item = self.tree.identify_row(event.y)
         column = self.tree.identify_column(event.x)
-        # "#2" — колонка «Стр.» (форматы), "#5" — «Время» (подробно); "#0" — колонка дерева
-        if not item or column not in ("#2", "#5"):
+        # "#2" «Стр.» (форматы), "#3" «Напеч.» (что напечатано), "#6" «Время» (подробно); "#0" — дерево
+        if not item or column not in ("#2", "#3", "#6"):
             self._hide_tip()
             return
         tags = self.tree.item(item, "tags")
         meta = self._meta.get(tags[0], {}) if tags else {}
-        text = "\n".join(meta.get("formats") or []) if column == "#2" else meta.get("time_tip", "")
+        if column == "#2":
+            text = "\n".join(meta.get("formats") or [])
+        elif column == "#3":
+            text = "\n".join(meta.get("printed_tip") or [])
+        else:
+            text = meta.get("time_tip", "")
         if not text:
             self._hide_tip()
             return

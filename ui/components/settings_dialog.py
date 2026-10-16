@@ -37,11 +37,13 @@ class SettingsDialog(tk.Toplevel):
         self.tab_engines = self.tabview.add("Движки")
         self.tab_system = self.tabview.add("Система")
         self.tab_speed = self.tabview.add("Скорость")
+        self.tab_printers = self.tabview.add("Принтеры")
         
         self._build_general_tab()
         self._build_engines_tab()
         self._build_system_tab()
         self._build_speed_tab()
+        self._build_printers_tab()
         
     def _build_general_tab(self):
         # Global scale
@@ -67,6 +69,17 @@ class SettingsDialog(tk.Toplevel):
         dpi_hint = ctk.CTkLabel(self.tab_general, text="300 — оптимально для чертежей. 150 — быстро, но мелкий текст может размыться. 600 — максимальное качество.",
                                 font=("Segoe UI", 10), text_color="gray", wraplength=350, justify="left")
         dpi_hint.grid(row=2, column=0, columnspan=2, padx=10, pady=(2, 10), sticky="w")
+
+        # Порог «тяжёлой» страницы — в тысячах векторных команд (линий/кривых)
+        from core.pdf_utils import HEAVY_OPS_DEFAULT
+        ctk.CTkLabel(self.tab_general, text="Тяжёлая страница — от, тыс. линий:").grid(row=3, column=0, padx=10, pady=(10, 0), sticky="w")
+        self.entry_heavy = ctk.CTkEntry(self.tab_general, width=100)
+        self.entry_heavy.insert(0, str(int(self.cfg.get("heavy_ops_threshold", HEAVY_OPS_DEFAULT)) // 1000))
+        self.entry_heavy.grid(row=3, column=1, padx=10, pady=(10, 0), sticky="w")
+        ctk.CTkLabel(self.tab_general, text="Сколько линий у каждой страницы — в колонке «Сложн.» справа. Тяжёлые страницы "
+                     "помечаются ⚡ и на плоттере растеризуются перед печатью. Повторный анализ не нужен.",
+                     font=("Segoe UI", 10), text_color="gray", wraplength=350, justify="left").grid(
+            row=4, column=0, columnspan=2, padx=10, pady=(2, 10), sticky="w")
         
     CHANNELS = {"Стабильная (рабочая)": "stable", "Бета (тестирование)": "beta", "Разработка (dev)": "dev"}
 
@@ -214,6 +227,73 @@ class SettingsDialog(tk.Toplevel):
         self.cfg.data["tg_token"] = self.entry_tg_token.get().strip()
         self.cfg.data["tg_chat_id"] = self.entry_tg_chat.get().strip()
 
+    def _build_printers_tab(self):
+        """Опрос принтеров по сети (SNMP): замятие, бумага, чернила по цветам, «печатает»."""
+        t = self.tab_printers
+        t.grid_columnconfigure(1, weight=1)
+        self.snmp_var = ctk.BooleanVar(master=self, value=bool(self.cfg.get("snmp_enabled", True)))
+        ctk.CTkCheckBox(t, text="Узнавать у принтеров замятие, бумагу и чернила по сети (SNMP)",
+                        variable=self.snmp_var).grid(row=0, column=0, columnspan=2, padx=10, pady=(8, 2), sticky="w")
+        ctk.CTkLabel(t, text="Адрес берётся из порта принтера в Windows. Если в подсказке у значка принтера "
+                     "написано «адрес не найден», впишите IP (он есть в меню принтера: Сеть → IPv4).",
+                     font=("Segoe UI", 10), text_color="gray", wraplength=420, justify="left").grid(
+            row=1, column=0, columnspan=2, padx=10, pady=(0, 8), sticky="w")
+        hosts = dict(self.cfg.get("printer_hosts", {}) or {})
+        m = self.master
+        self._host_entries = {}
+        for r, (title, attr) in enumerate((("IP принтера", "_current_laser"), ("IP плоттера", "_current_plotter")), start=2):
+            name = getattr(m, attr, "") or ""
+            ctk.CTkLabel(t, text=f"{title}\n({name[:30] or 'не выбран'}):", justify="left").grid(
+                row=r, column=0, padx=10, pady=4, sticky="w")
+            e = ctk.CTkEntry(t, width=160, placeholder_text="авто")
+            if hosts.get(name):
+                e.insert(0, hosts[name])
+            e.grid(row=r, column=1, padx=10, pady=4, sticky="w")
+            if name:
+                self._host_entries[name] = e
+        ctk.CTkLabel(t, text="SNMP community:").grid(row=4, column=0, padx=10, pady=4, sticky="w")
+        self.entry_community = ctk.CTkEntry(t, width=160)
+        self.entry_community.insert(0, self.cfg.get("snmp_community", "public") or "public")
+        self.entry_community.grid(row=4, column=1, padx=10, pady=4, sticky="w")
+
+        # Лоток выдачи — чтобы не переполнялся (HP M435/M436 — 250 л. по паспорту, корзина TM-305 — ≈8 свёрнутых A2)
+        from core.output_tray import LASER_CAPACITY, PLOTTER_CAPACITY, DEFAULT_FILL_PCT
+        self._tray_entries = {}
+        for r, (key, title, default) in enumerate((
+                ("laser_tray_capacity", "Лоток выдачи принтера, листов:", LASER_CAPACITY),
+                ("plotter_tray_capacity", "Корзина плоттера, листов A2 (0 — без пауз):", PLOTTER_CAPACITY),
+                ("tray_fill_pct", "Заполнять лоток принтера на, %:", DEFAULT_FILL_PCT)), start=5):
+            ctk.CTkLabel(t, text=title).grid(row=r, column=0, padx=10, pady=4, sticky="w")
+            e = ctk.CTkEntry(t, width=80)
+            e.insert(0, str(self.cfg.get(key, default)))
+            e.grid(row=r, column=1, padx=10, pady=4, sticky="w")
+            self._tray_entries[key] = e
+        ctk.CTkLabel(t, text="Когда лоток заполнится, печать встанет на паузу и программа попросит забрать листы — "
+                     "уже после того, как они реально напечатаются; дальше печать идёт только после ОК. "
+                     "Корзина плоттера считается в листах A2: A1 = 2, A0 = 4, A3 = 0.5.", font=("Segoe UI", 10), text_color="gray", wraplength=420,
+                     justify="left").grid(row=8, column=0, columnspan=2, padx=10, pady=(2, 8), sticky="w")
+
+    def _store_printer_settings(self):
+        self.cfg.data["snmp_enabled"] = bool(self.snmp_var.get())
+        self.cfg.data["snmp_community"] = self.entry_community.get().strip() or "public"
+        hosts = dict(self.cfg.get("printer_hosts", {}) or {})
+        for name, e in self._host_entries.items():
+            v = e.get().strip()
+            if v:
+                hosts[name] = v
+            else:
+                hosts.pop(name, None)
+        self.cfg.data["printer_hosts"] = hosts
+        for key, e in self._tray_entries.items():
+            try:
+                self.cfg.data[key] = max(0, int(float(e.get().replace(",", "."))))
+            except ValueError:
+                pass
+        probe = getattr(self.master, "printer_probe", None)
+        if probe is not None:
+            probe.community = self.cfg.data["snmp_community"]
+            probe.reset()
+
     def _build_engines_tab(self):
         # Print Engine selection
         ctk.CTkLabel(self.tab_engines, text="Движок печати:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
@@ -252,8 +332,15 @@ class SettingsDialog(tk.Toplevel):
         self.cfg.data["print_engine"] = self.engine_var.get()
         self.cfg.data["foxit_path"] = self.entry_foxit.get().strip()
         self.cfg.data["rasterize_dpi"] = int(self.dpi_slider.get())
+        self._store_printer_settings()
+        try:
+            self.cfg.data["heavy_ops_threshold"] = max(int(float(self.entry_heavy.get().replace(",", "."))), 1) * 1000
+        except ValueError:
+            pass
         self.cfg.save()  # одна запись на диск вместо десяти
         master = self.master
         self._close()
         if hasattr(master, "_update_plan_and_ui"):
             master.after(50, master._update_plan_and_ui)  # пересчитать время печати с новыми скоростями
+        if hasattr(master, "check_updates_soon"):
+            master.check_updates_soon()  # канал/репозиторий могли смениться — проверить через 5 с

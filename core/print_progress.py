@@ -20,15 +20,16 @@ class PrintTracker:
         self._clock = clock
         self._ids = itertools.count(1)
         self.jobs = {}          # id -> dict
+        self.changed = False    # было ли изменение состояния заданий с прошлого tick()
 
     # ───────────── события ─────────────
-    def add(self, filepath, fmt, pages, copies, printer, kind, est_seconds):
+    def add(self, filepath, fmt, pages, copies, printer, kind, est_seconds, page_list=None):
         jid = next(self._ids)
         self.jobs[jid] = {
             "id": jid, "file": filepath, "fmt": fmt, "pages": int(pages), "copies": int(copies),
             "printer": printer, "kind": kind, "est": max(float(est_seconds), 5.0),
             "state": "queued", "started": None, "spooled": None, "finished": None,
-            "printed": 0, "total": 0,
+            "printed": 0, "total": 0, "page_list": list(page_list or []),
         }
         return jid
 
@@ -55,6 +56,7 @@ class PrintTracker:
         j = self.jobs.get(jid)
         if j and j["state"] not in ("done",):
             j["state"], j["finished"] = "error", self._clock()
+            self.changed = True
 
     def tick(self):
         """Переводит в «готово» задания, чьё ориентировочное время печати истекло.
@@ -65,6 +67,7 @@ class PrintTracker:
             if j["state"] == "printing" and now >= j["started"] + j["est"]:
                 j["state"], j["finished"] = "done", now
                 touched.add(j["file"])
+                self.changed = True
         return [f for f in touched if self.active_count(f) == 0]
 
     def clear_finished(self, printer=None, older_than=10.0):
@@ -103,6 +106,34 @@ class PrintTracker:
         if "queued" in states:
             return "queued"
         return None
+
+    def printing_now(self, printer):
+        """Есть ли у принтера задание, которое отправляется или ещё печатается (по расчёту).
+        Вызывается и из потока очереди печати — поэтому работаем со снимком."""
+        for _ in range(3):
+            try:
+                return any(j["printer"] == printer and j["state"] in ("sending", "printing")
+                           for j in list(self.jobs.values()))
+            except RuntimeError:
+                continue
+        return False
+
+    def active_formats(self, filepath):
+        """Форматы файла, которые ещё печатаются или ждут очереди."""
+        return {j["fmt"] for j in self.jobs.values()
+                if j["file"] == filepath and j["state"] in ("queued", "sending", "printing")}
+
+    def active_pages(self, filepath):
+        """Страницы файла, которые ещё печатаются или ждут очереди."""
+        out = set()
+        for j in self.jobs.values():
+            if j["file"] == filepath and j["state"] in ("queued", "sending", "printing"):
+                out.update(j["page_list"])
+        return out
+
+    def pop_changed(self):
+        ch, self.changed = self.changed, False
+        return ch
 
     def is_busy(self):
         return self.active_count() > 0

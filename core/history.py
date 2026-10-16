@@ -204,7 +204,15 @@ class PrintHistory:
             # Раньше сшивка не записывалась в журнал: «Отчёт» не мог посчитать скорость,
             # а колонка «Время» — показать, когда файл сшит.
             if copies > 0:
-                self._log_transaction(filepath, page_number, "fold", copies)
+                fmt = ""
+                try:
+                    with db_connect(self.db_path) as conn:
+                        row = conn.execute("SELECT format FROM printed_pages WHERE filepath=? AND page_number=? "
+                                           "AND format != '' LIMIT 1", (filepath, page_number)).fetchone()
+                        fmt = row[0] if row else ""
+                except Exception:
+                    pass
+                self._log_transaction(filepath, page_number, "fold", copies, fmt)
         except Exception as e:
             log.error(f"Error setting folded copies: {e}")
 
@@ -229,6 +237,20 @@ class PrintHistory:
                         d["print_first"], d["print_last"] = parse(t_min), parse(t_max)
                     elif action == "fold":
                         d["fold_last"] = parse(t_max)
+                # По форматам — для подсказки «когда какой формат печатали»
+                c.execute(f"SELECT filepath, format, action, MIN(timestamp), MAX(timestamp) FROM transactions "
+                          f"WHERE filepath {where} ? GROUP BY filepath, format, action", (arg,))
+                for fp, fmt, action, t_min, t_max in c.fetchall():
+                    if not fmt:
+                        continue
+                    fmt = str(fmt).replace(" [V]", "")   # старые записи: «A4 [V]» = A4
+                    f = res.setdefault(fp, {}).setdefault("by_format", {}).setdefault(fmt, {})
+                    if action == "print":
+                        a, b = parse(t_min), parse(t_max)
+                        f["print_first"] = min(filter(None, [f.get("print_first"), a]), default=None)
+                        f["print_last"] = max(filter(None, [f.get("print_last"), b]), default=None)
+                    elif action == "fold":
+                        f["fold_last"] = max(filter(None, [f.get("fold_last"), parse(t_max)]), default=None)
                 # Запасной вариант для старых записей без журнала: время из printed_pages
                 c.execute(f"SELECT filepath, MIN(timestamp), MAX(timestamp) FROM printed_pages "
                           f"WHERE copies > 0 AND filepath {where} ? GROUP BY filepath", (arg,))

@@ -84,7 +84,7 @@ class ReportDialog(tk.Toplevel):
                 dt = datetime.datetime.fromisoformat(ts_str)
                 key = (fp, pn)
                 if key not in events:
-                    events[key] = {'print': None, 'fold': None, 'fmt': fmt}
+                    events[key] = {'print': None, 'fold': None, 'fmt': str(fmt or "").replace(" [V]", "")}
                 
                 # Keep earliest print and latest fold
                 if action == 'print':
@@ -166,7 +166,7 @@ class ReportDialog(tk.Toplevel):
             elif action == 'fold':
                 folded += copies
                 
-            fmt = str(fmt).upper().replace(" ", "")
+            fmt = str(fmt).upper().replace(" ", "").replace("[V]", "")   # старое «A4 [V]» = A4
             if not fmt: fmt = "UNKNOWN"
             if fmt not in formats_count:
                 formats_count[fmt] = {'print': 0, 'fold': 0}

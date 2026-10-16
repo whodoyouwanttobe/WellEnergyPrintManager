@@ -12,7 +12,7 @@ import threading
 from contextlib import contextmanager
 
 # Увеличьте, если поменялась логика analyze_pdf — старый кэш станет недействительным.
-ANALYSIS_VERSION = 2
+ANALYSIS_VERSION = 3   # 3: формат без « [V]», 8-е поле — число векторных команд
 
 log = logging.getLogger(__name__)
 

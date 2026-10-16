@@ -40,13 +40,18 @@ class PrintJob:
         self.format_name = format_name
         self.scale = scale
         self.rasterize_dpi = rasterize_dpi
+        self.heavy = False   # есть тяжёлые страницы (много векторных команд) — растеризовать перед печатью
 
 class PauseJob:
-    def __init__(self, message, title="Внимание"):
+    def __init__(self, message, title="Внимание", wait_until=None, printer_name=""):
         self.message = message
         self.title = title
         self.event = threading.Event()
         self.cancelled = False
+        # Окно «заберите листы» показываем, когда предыдущие задания РЕАЛЬНО напечатаны,
+        # а не когда Windows отдала их принтеру (лазерный принимает задание за секунды).
+        self.wait_until = wait_until
+        self.printer_name = printer_name
 
 class PrintQueueManager:
     def __init__(self):
@@ -79,8 +84,8 @@ class PrintQueueManager:
         self.queues[printer_name].put(job)
         return job
 
-    def add_pause(self, printer_name, message, title="Внимание"):
-        job = PauseJob(message, title)
+    def add_pause(self, printer_name, message, title="Внимание", wait_until=None):
+        job = PauseJob(message, title, wait_until, printer_name)
         self._ensure_thread(printer_name)
         self.queues[printer_name].put(job)
         return job
@@ -123,6 +128,16 @@ class PrintQueueManager:
                     q.task_done()
                     continue
                     
+                if job.wait_until is not None:
+                    waited = 0.0
+                    while not self._stop_event.is_set() and waited < 3600:
+                        try:
+                            if job.wait_until():
+                                break
+                        except Exception:
+                            break
+                        time.sleep(0.5)
+                        waited += 0.5
                 # Trigger UI to show messagebox
                 if hasattr(self, 'on_pause_request') and self.on_pause_request:
                     self.on_pause_request(job)
@@ -417,7 +432,7 @@ class PrintQueueManager:
                         paper_size = int(parts[5]) if len(parts) > 5 else 256
                         
                         # Pre-rasterize heavy formats to speed up Foxit spooling
-                        if self._should_rasterize(job.format_name):
+                        if self._should_rasterize(job.format_name) or getattr(job, "heavy", False):
                             raster_file = self._rasterize_pdf(target_file, dpi=job.rasterize_dpi)
                             if raster_file:
                                 # Use rasterized file instead of original

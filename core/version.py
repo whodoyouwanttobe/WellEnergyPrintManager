@@ -5,6 +5,7 @@
 APP_VERSION = "4.9.1"
 BUILD_CHANNEL = "local"   # local / dev / beta / stable
 BUILD_NUMBER = 0
+DOCS_REVISION = ""     # дата редакции docs/help.md, ставится при сборке
 
 if BUILD_CHANNEL in ("dev", "beta"):
     FULL_VERSION = f"{APP_VERSION}-{BUILD_CHANNEL}.{BUILD_NUMBER}"

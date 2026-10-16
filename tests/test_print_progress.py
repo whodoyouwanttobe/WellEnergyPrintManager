@@ -88,3 +88,19 @@ def test_file_state():
     c.t = 20
     tr.tick()
     assert tr.file_state("a.pdf") is None
+
+
+def test_active_formats_and_pages_until_really_printed():
+    """Галочка «Завершен» у формата — только когда задание реально допечатано."""
+    tr, c = make()
+    j = tr.add("a.pdf", "A4", 3, 1, "HP", "laser", 60, page_list=[1, 2, 3])
+    tr.add("a.pdf", "A1", 1, 1, "Canon", "plotter", 200, page_list=[4])
+    tr.start(j)
+    tr.spooled(j)                         # очередь Windows отдала — отметка в БД уже есть
+    assert tr.active_formats("a.pdf") == {"A4", "A1"}
+    assert tr.active_pages("a.pdf") == {1, 2, 3, 4}
+    assert tr.pop_changed() is False
+    c.t = 61
+    tr.tick()
+    assert tr.pop_changed() is True       # интерфейс обновит отметки
+    assert tr.active_formats("a.pdf") == {"A1"} and tr.active_pages("a.pdf") == {4}

@@ -151,6 +151,60 @@ def decode_pdf_label(lbl):
             return match.group(0)
     return re.sub(r'<FEFF([0-9A-Fa-f]+)>', replacer, lbl)
 
+# ───────────── тяжёлые страницы ─────────────
+# Раньше «тяжёлой» считалась страница с потоком команд > 500 КБ — под это попадала
+# половина обычных чертежей. Теперь считаем сами векторные команды (линии, кривые,
+# прямоугольники), включая вложенные блоки (Form XObject), и сравниваем с порогом
+# из настроек. Число команд хранится в анализе (8-е поле), поэтому смена порога
+# не требует повторного анализа.
+HEAVY_OPS_DEFAULT = 300_000
+_PATH_OPS = re.compile(rb"\s(?:l|c|v|y|re|m)(?=\s)")
+
+
+def page_complexity(page) -> int:
+    """Число векторных команд на странице (вместе с блоками XObject)."""
+    doc = page.parent
+    seen = set()
+    total = 0
+    xrefs = list(page.get_contents())
+    try:
+        xrefs += [x[0] for x in page.get_xobjects()]
+    except Exception:
+        pass
+    for xref in xrefs:
+        if xref in seen or not xref:
+            continue
+        seen.add(xref)
+        try:
+            data = doc.xref_stream(xref) or b""
+        except Exception:
+            continue
+        total += len(_PATH_OPS.findall(data))
+    return total
+
+
+def clean_format(fmt) -> str:
+    """Формат без старой пометки « [V]» (из истории и кэша старых версий)."""
+    return str(fmt or "").replace(" [V]", "").replace("[V]", "").strip()
+
+
+def page_ops(info) -> int:
+    v = info[7] if len(info) > 7 else 0
+    return int(v) if isinstance(v, (int, float)) else 0
+
+
+def heavy_threshold() -> int:
+    try:
+        from core.config import get_config
+        return max(int(get_config().get("heavy_ops_threshold", HEAVY_OPS_DEFAULT)), 1000)
+    except Exception:
+        return HEAVY_OPS_DEFAULT
+
+
+def is_heavy_page(info, threshold=None) -> bool:
+    return page_ops(info) >= (threshold or heavy_threshold())
+
+
 def analyze_pdf(filepath: str) -> list:
     """
     Анализ PDF файла и возвращение списка форматов страниц.
@@ -169,13 +223,9 @@ def analyze_pdf(filepath: str) -> list:
         is_landscape = (page.rect.width > page.rect.height)
         is_black = False
         
-        # Проверка на тяжёлый вектор
-        try:
-            stream_len = sum(len(page.parent.xref_stream(xref) or b'') for xref in page.get_contents())
-            if stream_len > 500_000:  # Больше 500 КБ векторных инструкций
-                fmt += " [V]"
-        except Exception:
-            pass
+        # Сложность страницы (число векторных команд). Формат при этом НЕ меняется:
+        # раньше к нему дописывалось « [V]», и тяжёлые A3 уходили на плоттер, а A4 делился на две группы.
+        ops = page_complexity(page)
 
         try:
             pix = page.get_pixmap(matrix=fitz.Matrix(0.05, 0.05))
@@ -190,7 +240,7 @@ def analyze_pdf(filepath: str) -> list:
         except Exception:
             pass
             
-        pages_info.append((i + 1, fmt, w_mm, h_mm, lbl, is_landscape, is_black))
+        pages_info.append((i + 1, fmt, w_mm, h_mm, lbl, is_landscape, is_black, ops))
     doc.close()
     return pages_info
     
@@ -877,7 +927,7 @@ def compress_pages(pages):
     return ", ".join(parts)
 
 def is_laser(fmt):
-    return fmt in {"A4", "A3"}
+    return clean_format(fmt) in {"A4", "A3"}
 
 def build_print_plan(files_analysis, printed_pages=None, target_copies=1):
     import os
@@ -930,8 +980,13 @@ def build_print_plan(files_analysis, printed_pages=None, target_copies=1):
         "grand_total": lt + pt,
     }
     return plan
-def get_complexity_weight(fmt):
+def get_complexity_weight(fmt, heavy=False):
+    """Условная «сложность» листа для прогресса и оценок. heavy — страница тяжёлая
+    (см. is_heavy_page). Старая пометка « [V]» в формате тоже считается тяжёлой."""
     f = str(fmt).upper().replace(" ", "")
+    if "[V]" in f:
+        heavy = True
+        f = f.replace("[V]", "")
     base_weight = 1
     if "A4" in f and "X" not in f: base_weight = 1
     elif "A3" in f and "X" not in f: base_weight = 2
@@ -947,7 +1002,7 @@ def get_complexity_weight(fmt):
             base_weight = b_w * mult
             
     # Добавляем искусственный вес для тяжёлых векторных страниц
-    if "[V]" in f:
+    if heavy:
         base_weight += 12
         
     return base_weight

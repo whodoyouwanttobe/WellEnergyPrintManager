@@ -56,4 +56,29 @@ def long_time(times, session=None):
             lines.append(f"Печать: {last:%d.%m.%Y %H:%M}")
     if times.get("fold_last"):
         lines.append(f"Сшито: {times['fold_last']:%d.%m.%Y %H:%M}")
+    by_fmt = times.get("by_format") or {}
+    if by_fmt:
+        lines.append("По форматам:")
+        for fmt in sorted(by_fmt, key=_fmt_order):
+            t = by_fmt[fmt]
+            parts = []
+            pf, pl = t.get("print_first"), t.get("print_last")
+            if pl:
+                if pf and pf.date() == pl.date() and _hm(pf) != _hm(pl):
+                    parts.append(f"печать {pl:%d.%m} {_hm(pf)}–{_hm(pl)}")
+                else:
+                    parts.append(f"печать {pl:%d.%m %H:%M}")
+            if t.get("fold_last"):
+                parts.append(f"сшит {t['fold_last']:%d.%m %H:%M}")
+            if parts:
+                lines.append(f"  {fmt}: " + ", ".join(parts))
     return "\n".join(lines)
+
+
+def _fmt_order(fmt):
+    """A4, A3, A2, A1, A0, затем склейки и прочее."""
+    import re
+    m = re.match(r"A(\d)(?:X(\d+))?", str(fmt).upper().replace(" ", ""))
+    if not m:
+        return (9, 0, str(fmt))
+    return (int(m.group(2) or 0) > 0, -int(m.group(1)), int(m.group(2) or 0))

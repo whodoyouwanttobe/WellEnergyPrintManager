@@ -26,6 +26,7 @@ SCAN_TIMEOUT = 90.0
 def prepare_environment(tmp_dir):
     """Вызывать ДО импорта core.config: подменяем APPDATA на временную папку."""
     os.environ["APPDATA"] = tmp_dir
+    os.environ["WPM_NO_TOUR"] = "1"   # обучение проверяем отдельно, без автопредложения
     os.makedirs(os.path.join(tmp_dir, "WellEnergyPrintManager"), exist_ok=True)
 
 
@@ -191,6 +192,7 @@ def run_self_test(work_dir):
             ("Отчёт", app.show_report, "_report_dlg"),
             ("Пробная печать", app.show_trial_print, "_visualizer_dlg"),
             ("Сообщить об ошибке", app._open_bug_report, "_bug_dlg"),
+            ("Справка", app.open_help, "_help_dlg"),
         ]
         for title, opener, attr in dialogs:
             gaps["max"] = 0.0
@@ -213,6 +215,21 @@ def run_self_test(work_dir):
                     res.check(not dlg.winfo_exists(), f"окно «{title}» закрывается")
             except Exception as e:
                 res.check(False, f"окно «{title}»", f"{type(e).__name__}: {e}")
+
+        # 4б. обучение: проходит все шаги и закрывается без следов
+        try:
+            tour = app.start_tour()
+            pump_until(lambda: False, 0.5)
+            res.check(tour is not None and tour.bubble.winfo_viewable(), "обучение: пузырь показан")
+            for _ in range(len(tour.steps) - 1):
+                tour.next()
+                app.update()
+            res.check(tour.index == len(tour.steps) - 1, "обучение: все шаги пройдены")
+            tour.close()
+            app.update()
+            res.check(app._tour is None and not tour.bubble.winfo_exists(), "обучение закрывается ✕")
+        except Exception as e:
+            res.check(False, "обучение", f"{type(e).__name__}: {e}")
 
         leftovers = [w for w in app.winfo_children() if isinstance(w, tk.Toplevel) and w.winfo_exists()]
         res.check(not leftovers, "не осталось висящих окон", ", ".join(type(w).__name__ for w in leftovers))
