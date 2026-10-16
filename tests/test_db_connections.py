@@ -1,4 +1,5 @@
 """Все соединения с SQLite должны закрываться — иначе на Windows файл БД остаётся занятым."""
+import os
 import sqlite3
 
 import core.history as history_mod
@@ -53,3 +54,12 @@ def test_cache_closes_connections(monkeypatch, tmp_path):
     c.put(str(pdf), [(1, "A4", 210.0, 297.0, "1", False, False)])
     assert c.get(str(pdf))
     assert _Tracked.opened and all(x.closed for x in _Tracked.opened)
+
+
+def test_tests_never_use_project_config(tmp_path, monkeypatch):
+    """В папке проекта может лежать настоящий print_config.json — тесты его не трогают."""
+    import core.config as cfg
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "print_config.json").write_text('{"db_path": "real.db"}', encoding="utf-8")
+    p = cfg.get_config_path("print_config.json")
+    assert os.environ["WPM_DATA_DIR"] in p and str(tmp_path) not in p

@@ -14,22 +14,12 @@ class FoxitEngine(PrintEngineBase):
 
     def print_file(self, filepath: str, printer_name: str, settings: str, copies: int = 1) -> bool:
         if not os.path.exists(self.executable_path):
-            # Try to dynamically find Foxit if config path is wrong
-            paths = [
-                r"C:\Program Files (x86)\Foxit Software\Foxit PDF Editor\FoxitPDFEditor.exe",
-                r"C:\Program Files\Foxit Software\Foxit PDF Editor\FoxitPDFEditor.exe",
-                r"C:\Program Files (x86)\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe",
-                r"C:\Program Files\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe",
-                r"C:\Program Files (x86)\Foxit Software\Foxit Reader\FoxitReader.exe",
-                r"C:\Program Files\Foxit Software\Foxit Reader\FoxitReader.exe"
-            ]
-            found = False
-            for p in paths:
-                if os.path.exists(p):
-                    self.executable_path = p
-                    found = True
-                    break
-            
+            # Путь из настроек неверный — ищем в стандартных местах
+            from core.engines import find_foxit
+            p = find_foxit(self.executable_path)
+            found = p is not None
+            if found:
+                self.executable_path = p
             if not found:
                 logging.error(f"Foxit executable missing. Tried {self.executable_path} and standard paths.")
                 return False

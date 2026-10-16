@@ -5,6 +5,13 @@ import threading
 import sys
 
 def get_config_path(filename):
+    # Тесты и самопроверка работают ТОЛЬКО во временной папке: раньше, если в текущей папке
+    # (папке проекта) лежал print_config.json, тесты читали и меняли настоящие настройки
+    # и историю печати.
+    forced = os.environ.get("WPM_DATA_DIR")
+    if forced:
+        os.makedirs(forced, exist_ok=True)
+        return os.path.join(forced, filename)
     cwd = os.getcwd()
     appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
     legacy_dir = os.path.join(appdata, "WellEnergyPrintManager")

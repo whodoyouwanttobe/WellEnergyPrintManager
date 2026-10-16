@@ -157,7 +157,8 @@ class PrintManagerApp(ctk.CTk):
         except Exception:
             pass
         # Первый запуск — предложить обучение (один раз)
-        if not self.cfg.get("tour_offered") and not os.environ.get("WPM_NO_TOUR"):
+        from ui.components.tour import TOUR_VERSION
+        if int(self.cfg.get("tour_seen_version", 0) or 0) < TOUR_VERSION and not os.environ.get("WPM_NO_TOUR"):
             self.after(1500, lambda: self.start_tour(offer=True))
     # ───────────── потокобезопасность и ошибки ─────────────
     def ui_call(self, fn, *args):
@@ -474,6 +475,8 @@ class PrintManagerApp(ctk.CTk):
             fails[name] = 0
         tracker = self.print_tracker.printer_summary(name)
         st = combine(spooler, snmp, tracker, plotter=(role == "plotter"))
+        # Принтер встал (нет бумаги/замятие…) — замораживаем расчётное время его заданий
+        self.print_tracker.set_stopped(name, st["stopped"])
         lbl = self.laser_status_lbl if role == "laser" else self.plotter_status_lbl
         short = st["text"] if len(st["text"]) <= 26 else st["text"][:25] + "…"
         try:
@@ -561,6 +564,28 @@ class PrintManagerApp(ctk.CTk):
                 pass
             self._printer_tip = None
 
+    def _laser_choices(self):
+        """Список в поле «Принтер»: принтеры из «Настройки → Принтеры» (1–2 шт.),
+        а если там ничего не задано — все принтеры Windows."""
+        system = list(getattr(self, "_system_printers", []) or [])
+        configured = [p for p in (self.cfg.get("laser_printers", []) or []) if p]
+        return configured or system or ["Default Printer"]
+
+    def apply_printer_setup(self):
+        """После сохранения «Настройки → Принтеры»: обновить списки вверху окна."""
+        choices = self._laser_choices()
+        try:
+            self.laser_combo.configure(values=choices)
+        except AttributeError:
+            pass
+        if self.laser_printer_var.get() not in choices:
+            self.laser_printer_var.set(choices[0])
+            self._on_laser_changed(choices[0])
+        plotter = self.cfg.get("printers", {}).get("plotter", {}).get("name", "")
+        if plotter and plotter != self.plotter_printer_var.get():
+            self.plotter_printer_var.set(plotter)
+            self._on_plotter_changed(plotter)
+
     def _get_system_printers(self):
         # Раньше здесь запускался внешний 'python -c ...' — в собранном exe на чужом ПК
         # python может отсутствовать, а Windows ищет python.exe в т.ч. в текущей папке
@@ -614,10 +639,14 @@ class PrintManagerApp(ctk.CTk):
         def load_printers():
             real_printers = self._get_system_printers()
             def update_ui():
-                if self.laser_printer_var.get() not in real_printers: self.laser_printer_var.set(real_printers[0])
+                self._system_printers = real_printers
+                laser_choices = self._laser_choices()
+                if self.laser_printer_var.get() not in laser_choices:
+                    self.laser_printer_var.set(laser_choices[0])
+                    self._current_laser = laser_choices[0]
                 if self.plotter_printer_var.get() not in real_printers: self.plotter_printer_var.set(real_printers[0])
                 try:
-                    self.laser_combo.configure(values=real_printers)
+                    self.laser_combo.configure(values=laser_choices)
                     self.plotter_combo.configure(values=real_printers)
                 except AttributeError:
                     pass
@@ -637,6 +666,9 @@ class PrintManagerApp(ctk.CTk):
         self.plotter_status_lbl.pack(side="right", padx=(0, 5))
         
         def _on_plotter_changed(v):
+            self.plotter_status_lbl.configure(text="⚪ Опрос…")
+            if hasattr(self, "_printer_tips"):
+                self._printer_tips["plotter"] = ""
             self._current_plotter = v
             printers_cfg = self.cfg.get("printers", {})
             if "plotter" not in printers_cfg: printers_cfg["plotter"] = {}
@@ -644,6 +676,7 @@ class PrintManagerApp(ctk.CTk):
             self.cfg.set("printers", printers_cfg)
             self._update_plan_and_ui()  # пересчитать время под другую модель
             
+        self._on_plotter_changed = _on_plotter_changed
         self.plotter_combo = ctk.CTkOptionMenu(toolbar, variable=self.plotter_printer_var, values=printers, width=130, command=_on_plotter_changed)
         self.plotter_combo.pack(side="right", padx=(5, 0), pady=5)
         ctk.CTkLabel(toolbar, text="Плоттер:").pack(side="right", padx=(20, 5), pady=5)
@@ -653,12 +686,17 @@ class PrintManagerApp(ctk.CTk):
         
         def _on_laser_changed(v):
             self._current_laser = v
+            # состояние показываем для выбранного принтера — старое сразу убираем
+            self.laser_status_lbl.configure(text="⚪ Опрос…")
+            if hasattr(self, "_printer_tips"):
+                self._printer_tips["laser"] = ""
             printers_cfg = self.cfg.get("printers", {})
             if "laser" not in printers_cfg: printers_cfg["laser"] = {}
             printers_cfg["laser"]["name"] = v
             self.cfg.set("printers", printers_cfg)
             self._update_plan_and_ui()  # пересчитать время под другую модель
             
+        self._on_laser_changed = _on_laser_changed
         self.laser_combo = ctk.CTkOptionMenu(toolbar, variable=self.laser_printer_var, values=printers, width=130, command=_on_laser_changed)
         self.laser_combo.pack(side="right", padx=(5, 0), pady=5)
         ctk.CTkLabel(toolbar, text="Принтер:").pack(side="right", padx=(20, 5), pady=5)
@@ -696,6 +734,10 @@ class PrintManagerApp(ctk.CTk):
                                       on_set_copies=self.set_page_copies,
                                       on_change_format=self.change_page_format)
         self.result_view.pack(fill="both", expand=True, padx=5, pady=5)
+        # События для интерактивного обучения (add="+" — не мешают основным обработчикам)
+        self.file_tree.tree.bind("<Button-3>", lambda e: self._tour_event("file_menu"), add="+")
+        self.result_view.result_text.bind("<Button-3>", lambda e: self._tour_event("format_menu"), add="+")
+        self.result_view.detail_tree.bind("<ButtonPress-1>", lambda e: self._tour_event("page_preview"), add="+")
         
         # Bottom pane for print plan
         bottom_pane = ctk.CTkFrame(self, height=120)
@@ -1187,10 +1229,47 @@ class PrintManagerApp(ctk.CTk):
         self._update_plan_and_ui()
         
     def print_format_group(self, filepath, fmt, pages_list):
+        """Печать группы формата (правый клик в сводке). Если часть группы уже напечатана —
+        спрашиваем, допечатать недостающее или печатать всю группу заново
+        (раньше всегда печаталась вся группа)."""
         try: tc = self.target_copies.get()
         except: tc = 1
         import tkinter.simpledialog as sd
-        val = sd.askinteger("Печать группы", f"Количество копий для формата {fmt}:", initialvalue=tc, minvalue=1)
+        done = self.printed_pages.get(filepath, {})
+
+        def printed(p):
+            d = done.get(p, 0)
+            return d.get("printed", 0) if isinstance(d, dict) else int(d or 0)
+
+        missing_by_count = {}
+        for p in pages_list:
+            m = tc - printed(p)
+            if m > 0:
+                missing_by_count.setdefault(m, []).append(p)
+        missing_sheets = sum(m * len(pg) for m, pg in missing_by_count.items())
+        total_sheets = len(pages_list) * tc
+        already = total_sheets - missing_sheets
+
+        if already > 0:
+            if missing_sheets == 0:
+                if not messagebox.askyesno("Печать группы", f"Формат {fmt} уже напечатан полностью ({tc} коп.).\n\n"
+                                           "Напечатать всю группу ещё раз?", parent=self):
+                    return
+            else:
+                ans = messagebox.askyesnocancel(
+                    "Печать группы",
+                    f"Формат {fmt}: уже напечатано {already} из {total_sheets} листов.\n\n"
+                    f"ДА — допечатать только недостающее ({missing_sheets} л.)\n"
+                    f"НЕТ — напечатать всю группу заново\n"
+                    f"Отмена — ничего не печатать", parent=self)
+                if ans is None:
+                    return
+                if ans:
+                    for m, pgs in sorted(missing_by_count.items()):
+                        self._execute_print(filepath, fmt, pgs, copies=m)
+                    return
+        val = sd.askinteger("Печать группы", f"Количество копий для формата {fmt}:", initialvalue=tc, minvalue=1,
+                            parent=self)
         if val is None:
             return
         self._execute_print(filepath, fmt, pages_list, copies=val)
@@ -1234,7 +1313,34 @@ class PrintManagerApp(ctk.CTk):
                        f"{error_msg}\nПечать стоит — устраните, и принтер продолжит сам.", severity=PROBLEMS[key][0])
         self.ui_call(show)
             
+    def _tour_active(self):
+        t = getattr(self, "_tour", None)
+        return t is not None and getattr(t, "active", False)
+
+    def _print_done_info(self, text):
+        if self._tour_active():
+            text = (f"🎓 Обучение: это была имитация — на принтеры ничего не отправлено.\n\n"
+                    f"Всего ушло бы ≈{self._sim_sheets} л. Вне обучения: «{text}»")
+        messagebox.showinfo("Печать", text, parent=self)
+
+    def _simulate_print(self, filepath, fmt, pages_list, copies):
+        """Во время обучения печать не отправляется — только показываем, что ушло бы."""
+        from core.pdf_utils import is_laser
+        printer = self.laser_printer_var.get() if is_laser(fmt) else self.plotter_printer_var.get()
+        n = len(pages_list) * copies
+        self._sim_sheets = getattr(self, "_sim_sheets", 0) + n
+        n_ = getattr(self, "notifier", None)
+        if n_ is not None:
+            n_.show("tour:sim", "🎓 Обучение: печать не отправлена",
+                    f"Ушло бы на «{printer}»: {os.path.basename(filepath)}, {fmt}, "
+                    f"{len(pages_list)} стр. × {copies} коп.\nВсего в имитации: {self._sim_sheets} л.", severity=1)
+        logging.info("Обучение: имитация печати %s %s %s стр. x%s", filepath, fmt, len(pages_list), copies)
+        self._tour_event("print_simulated")
+
     def _execute_print(self, filepath, fmt, pages_list, copies=1):
+        if self._tour_active():
+            self._simulate_print(filepath, fmt, pages_list, copies)
+            return
         if self.completed_print_jobs >= self.total_print_jobs or self.total_print_jobs == 0:
             self.total_print_jobs = 0
             self.completed_print_jobs = 0
@@ -1286,10 +1392,20 @@ class PrintManagerApp(ctk.CTk):
                     f"Заберите напечатанные листы и нажмите ОК — печать продолжится только после этого.\n"
                     f"Отмена — снять оставшиеся задания этого принтера.",
                     title="Заберите листы",
-                    wait_until=lambda p=printer_name: not self.print_tracker.printing_now(p))
+                    wait_until=lambda p=printer_name: self._printer_finished(p))
         self.trays.set(printer_name, fill)
             
         self.queue_manager.start()
+
+    def _printer_finished(self, printer):
+        """Для окна «Заберите листы»: предыдущие листы реально вышли?
+        Нет — если по расчёту ещё печатает, если принтер стоит (нет бумаги, замятие)
+        или если сам принтер/Windows говорит, что печатает."""
+        if self.print_tracker.printing_now(printer):
+            return False
+        st = getattr(self, "_printer_states", {}).get(printer) or {}
+        busy = st.get("device_busy") or ""
+        return not (st.get("stopped") or busy.startswith(("Печатает", "Получает", "Обработка", "Прогрев")))
 
     def _tray_capacity(self, kind):
         """Сколько «мест» в лотке можно занять до паузы (паспорт × процент заполнения)."""
@@ -1479,10 +1595,12 @@ class PrintManagerApp(ctk.CTk):
 
     def start_tour(self, offer=False):
         from ui.components.tour import Tour
-        self.cfg.set("tour_offered", True)
+        from ui.components.tour import TOUR_VERSION
+        self.cfg.set("tour_seen_version", TOUR_VERSION)   # предлагаем один раз (до следующей версии обучения)
         old = getattr(self, "_tour", None)
         if old is not None:
             old.close()
+        self._sim_sheets = 0
         try:
             self._tour = Tour(self, offer=offer)
         except Exception:
@@ -1553,7 +1671,7 @@ class PrintManagerApp(ctk.CTk):
         if mode == "missing":
             for fmt, pgs, m in missing:
                 self._execute_print(filepath, fmt, pgs, copies=m)
-            messagebox.showinfo("Печать", f"«{name}»: в очередь добавлено недостающее — {missing_sheets} л.", parent=self)
+            self._print_done_info(f"«{name}»: в очередь добавлено недостающее — {missing_sheets} л.")
             return
 
         import tkinter.simpledialog as sd
@@ -1565,7 +1683,7 @@ class PrintManagerApp(ctk.CTk):
             fmt_groups.setdefault(info[1], []).append(info[0])
         for fmt, pages in fmt_groups.items():
             self._execute_print(filepath, fmt, pages, copies=copies)
-        messagebox.showinfo("Печать", f"Задания для «{name}» добавлены в очередь.", parent=self)
+        self._print_done_info(f"Задания для «{name}» добавлены в очередь.")
 
     def preview_single_file(self, filepath):
         """Open the visualizer for a single file (right-click action)."""
@@ -1610,7 +1728,7 @@ class PrintManagerApp(ctk.CTk):
                 self._execute_print(fp, inf["format"], pgs, copies=inf["missing"])
                 self.update() # Yield to UI to prevent freezing
                 
-        messagebox.showinfo("Печать", "Все задания добавлены в очередь.")
+        self._print_done_info("Все задания добавлены в очередь.")
             
     def on_print_start(self, job):
         import datetime

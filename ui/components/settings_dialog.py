@@ -240,21 +240,39 @@ class SettingsDialog(tk.Toplevel):
             row=1, column=0, columnspan=2, padx=10, pady=(0, 8), sticky="w")
         hosts = dict(self.cfg.get("printer_hosts", {}) or {})
         m = self.master
-        self._host_entries = {}
-        for r, (title, attr) in enumerate((("IP принтера", "_current_laser"), ("IP плоттера", "_current_plotter")), start=2):
-            name = getattr(m, attr, "") or ""
-            ctk.CTkLabel(t, text=f"{title}\n({name[:30] or 'не выбран'}):", justify="left").grid(
-                row=r, column=0, padx=10, pady=4, sticky="w")
-            e = ctk.CTkEntry(t, width=160, placeholder_text="авто")
-            if hosts.get(name):
-                e.insert(0, hosts[name])
-            e.grid(row=r, column=1, padx=10, pady=4, sticky="w")
-            if name:
-                self._host_entries[name] = e
-        ctk.CTkLabel(t, text="SNMP community:").grid(row=4, column=0, padx=10, pady=4, sticky="w")
+        system = list(getattr(m, "_system_printers", []) or [])
+        lasers = list(self.cfg.get("laser_printers", []) or [])
+        cur_laser = getattr(m, "_current_laser", "") or ""
+        if not lasers and cur_laser and cur_laser not in ("Default Printer", "Загрузка..."):
+            lasers = [cur_laser]
+        plotter = getattr(m, "_current_plotter", "") or self.cfg.get("printers", {}).get("plotter", {}).get("name", "")
+        NONE = "— нет —"
+        ctk.CTkLabel(t, text="Устройство", text_color="gray").grid(row=2, column=0, padx=10, sticky="w")
+        ctk.CTkLabel(t, text="IP (пусто — авто)", text_color="gray").grid(row=2, column=2, padx=10, sticky="w")
+        self._device_rows = []
+        for r, (title, value) in enumerate((("Принтер 1 (A4/A3):", lasers[0] if lasers else ""),
+                                            ("Принтер 2 (A4/A3):", lasers[1] if len(lasers) > 1 else ""),
+                                            ("Плоттер:", plotter)), start=3):
+            ctk.CTkLabel(t, text=title).grid(row=r, column=0, padx=10, pady=4, sticky="w")
+            values = [NONE] + [x for x in system if x] if title != "Плоттер:" else [x for x in system if x]
+            if value and value not in values:
+                values.append(value)
+            var = ctk.StringVar(master=self, value=value or (NONE if title != "Плоттер:" else (values[0] if values else "")))
+            ctk.CTkOptionMenu(t, variable=var, values=values or [NONE], width=230,
+                              dynamic_resizing=False).grid(row=r, column=1, padx=10, pady=4, sticky="w")
+            e = ctk.CTkEntry(t, width=130, placeholder_text="авто")
+            if value and hosts.get(value):
+                e.insert(0, hosts[value])
+            e.grid(row=r, column=2, padx=10, pady=4, sticky="w")
+            self._device_rows.append((title, var, e))
+        self._none_label = NONE
+        ctk.CTkLabel(t, text="Если принтеров два — переключайте их в списке «Принтер» вверху окна; "
+                     "состояние показывается для выбранного.", font=("Segoe UI", 10), text_color="gray",
+                     wraplength=470, justify="left").grid(row=6, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
+        ctk.CTkLabel(t, text="SNMP community:").grid(row=7, column=0, padx=10, pady=4, sticky="w")
         self.entry_community = ctk.CTkEntry(t, width=160)
         self.entry_community.insert(0, self.cfg.get("snmp_community", "public") or "public")
-        self.entry_community.grid(row=4, column=1, padx=10, pady=4, sticky="w")
+        self.entry_community.grid(row=7, column=1, padx=10, pady=4, sticky="w")
 
         # Лоток выдачи — чтобы не переполнялся (HP M435/M436 — 250 л. по паспорту, корзина TM-305 — ≈8 свёрнутых A2)
         from core.output_tray import LASER_CAPACITY, PLOTTER_CAPACITY, DEFAULT_FILL_PCT
@@ -262,7 +280,7 @@ class SettingsDialog(tk.Toplevel):
         for r, (key, title, default) in enumerate((
                 ("laser_tray_capacity", "Лоток выдачи принтера, листов:", LASER_CAPACITY),
                 ("plotter_tray_capacity", "Корзина плоттера, листов A2 (0 — без пауз):", PLOTTER_CAPACITY),
-                ("tray_fill_pct", "Заполнять лоток принтера на, %:", DEFAULT_FILL_PCT)), start=5):
+                ("tray_fill_pct", "Заполнять лоток принтера на, %:", DEFAULT_FILL_PCT)), start=8):
             ctk.CTkLabel(t, text=title).grid(row=r, column=0, padx=10, pady=4, sticky="w")
             e = ctk.CTkEntry(t, width=80)
             e.insert(0, str(self.cfg.get(key, default)))
@@ -271,49 +289,102 @@ class SettingsDialog(tk.Toplevel):
         ctk.CTkLabel(t, text="Когда лоток заполнится, печать встанет на паузу и программа попросит забрать листы — "
                      "уже после того, как они реально напечатаются; дальше печать идёт только после ОК. "
                      "Корзина плоттера считается в листах A2: A1 = 2, A0 = 4, A3 = 0.5.", font=("Segoe UI", 10), text_color="gray", wraplength=420,
-                     justify="left").grid(row=8, column=0, columnspan=2, padx=10, pady=(2, 8), sticky="w")
+                     justify="left").grid(row=11, column=0, columnspan=3, padx=10, pady=(2, 8), sticky="w")
 
     def _store_printer_settings(self):
         self.cfg.data["snmp_enabled"] = bool(self.snmp_var.get())
         self.cfg.data["snmp_community"] = self.entry_community.get().strip() or "public"
         hosts = dict(self.cfg.get("printer_hosts", {}) or {})
-        for name, e in self._host_entries.items():
-            v = e.get().strip()
-            if v:
-                hosts[name] = v
+        lasers, plotter = [], ""
+        for title, var, e in self._device_rows:
+            name = var.get()
+            if not name or name == self._none_label:
+                continue
+            if title == "Плоттер:":
+                plotter = name
+            elif name not in lasers:
+                lasers.append(name)
+            ip = e.get().strip()
+            if ip:
+                hosts[name] = ip
             else:
                 hosts.pop(name, None)
+        self.cfg.data["laser_printers"] = lasers
+        if plotter:
+            pr = self.cfg.data.setdefault("printers", {})
+            pr.setdefault("plotter", {})["name"] = plotter
         self.cfg.data["printer_hosts"] = hosts
         for key, e in self._tray_entries.items():
             try:
                 self.cfg.data[key] = max(0, int(float(e.get().replace(",", "."))))
             except ValueError:
                 pass
+        if hasattr(self.master, "apply_printer_setup"):
+            self.master.after(10, self.master.apply_printer_setup)
         probe = getattr(self.master, "printer_probe", None)
         if probe is not None:
             probe.community = self.cfg.data["snmp_community"]
             probe.reset()
 
     def _build_engines_tab(self):
-        # Print Engine selection
-        ctk.CTkLabel(self.tab_engines, text="Движок печати:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
-        self.engine_var = ctk.StringVar(master=self, value=self.cfg.get("print_engine", "sumatra"))
-        
-        self.radio_sumatra = ctk.CTkRadioButton(self.tab_engines, text="SumatraPDF (Встроенный)", variable=self.engine_var, value="sumatra")
-        self.radio_sumatra.grid(row=1, column=0, padx=10, pady=5, sticky="w")
-        
-        self.radio_foxit = ctk.CTkRadioButton(self.tab_engines, text="Foxit PDF Editor (Корпоративный)", variable=self.engine_var, value="foxit")
-        self.radio_foxit.grid(row=2, column=0, padx=10, pady=5, sticky="w")
-        
-        self.radio_pdf2printer = ctk.CTkRadioButton(self.tab_engines, text="PDFtoPrinter (Рекомендуется для плоттера)", variable=self.engine_var, value="pdftoprinter")
-        self.radio_pdf2printer.grid(row=3, column=0, padx=10, pady=5, sticky="w")
-        
-        # Foxit Path
-        ctk.CTkLabel(self.tab_engines, text="Путь к Foxit:").grid(row=4, column=0, padx=10, pady=10, sticky="w")
-        self.entry_foxit = ctk.CTkEntry(self.tab_engines, width=300)
+        """Не выбор движка (он определяется форматом), а описание: что чем печатается и где программы."""
+        from core.engines import find_foxit, find_sumatra
+        t = self.tab_engines
+        t.grid_columnconfigure(1, weight=1)
+        info = ("Движок выбирается автоматически по формату:\n"
+                "•  A4, A3 → лазерный принтер HP — Foxit (тихая печать, лоток A4/A3 ставится в драйвере).\n"
+                "•  A2, A1, A0, склейки → плоттер Canon — Foxit с размером бумаги в драйвере; "
+                "если не получилось — SumatraPDF.\n"
+                "•  A0, длинные склейки и тяжёлые ⚡ страницы на плоттере перед печатью превращаются "
+                "в картинку (DPI — во вкладке «Общие»).\n"
+                "•  Масштаб печати для всех — во вкладке «Общие» (99.94% по умолчанию).")
+        ctk.CTkLabel(t, text=info, justify="left", wraplength=470, anchor="w").grid(
+            row=0, column=0, columnspan=3, padx=10, pady=(8, 10), sticky="w")
+
+        ctk.CTkLabel(t, text="Foxit PDF Editor/Reader:", font=("Segoe UI", 12, "bold")).grid(
+            row=1, column=0, padx=10, pady=4, sticky="w")
+        self.entry_foxit = ctk.CTkEntry(t, width=300, placeholder_text="авто (стандартная папка установки)")
         self.entry_foxit.insert(0, self.cfg.get("foxit_path", ""))
-        self.entry_foxit.grid(row=4, column=1, padx=10, pady=10)
-        
+        self.entry_foxit.grid(row=1, column=1, padx=(10, 4), pady=4, sticky="ew")
+        ctk.CTkButton(t, text="Обзор…", width=70, command=self._browse_foxit).grid(row=1, column=2, padx=(0, 10))
+        self.foxit_status = ctk.CTkLabel(t, text="", anchor="w", justify="left", wraplength=470)
+        self.foxit_status.grid(row=2, column=0, columnspan=3, padx=10, pady=(0, 8), sticky="w")
+        self.entry_foxit.bind("<KeyRelease>", lambda e: self._update_engine_status())
+
+        ctk.CTkLabel(t, text="SumatraPDF (запасной):", font=("Segoe UI", 12, "bold")).grid(
+            row=3, column=0, padx=10, pady=4, sticky="w")
+        sp = find_sumatra(self.cfg.get("sumatra_path", ""))
+        ctk.CTkLabel(t, text=("✓ встроен в программу — настраивать не нужно" if sp else
+                              "✗ не найден (в собранной программе он встроен)"),
+                     text_color="#2ecc71" if sp else "#e74c3c", anchor="w").grid(
+            row=3, column=1, columnspan=2, padx=10, pady=4, sticky="w")
+        ctk.CTkLabel(t, text="Если Foxit не найден, установите Foxit PDF Editor или Reader либо укажите путь к "
+                     "FoxitPDFEditor.exe / FoxitPDFReader.exe кнопкой «Обзор…».",
+                     font=("Segoe UI", 10), text_color="gray", wraplength=470, justify="left").grid(
+            row=4, column=0, columnspan=3, padx=10, pady=(8, 4), sticky="w")
+        self._update_engine_status()
+
+    def _browse_foxit(self):
+        from tkinter import filedialog
+        p = filedialog.askopenfilename(parent=self, title="Где Foxit?", filetypes=[("Программа", "*.exe")])
+        if p:
+            self.entry_foxit.delete(0, "end")
+            self.entry_foxit.insert(0, p.replace("/", "\\"))
+            self._update_engine_status()
+
+    def _update_engine_status(self):
+        from core.engines import find_foxit
+        import os
+        typed = self.entry_foxit.get().strip()
+        found = find_foxit(typed)
+        if typed and not os.path.isfile(typed):
+            txt, col = f"✗ По этому пути файла нет. {'Найден: ' + found if found else 'Foxit не найден.'}", "#e74c3c"
+        elif found:
+            txt, col = f"✓ Используется: {found}", "#2ecc71"
+        else:
+            txt, col = "✗ Foxit не найден — печать на принтер HP и плоттер работать не будет.", "#e74c3c"
+        self.foxit_status.configure(text=txt, text_color=col)
+
     def save(self):
         try:
             scale = float(self.entry_scale.get().replace(",", "."))
@@ -329,7 +400,6 @@ class SettingsDialog(tk.Toplevel):
             return
         self.cfg.data["tg_token"] = self.entry_tg_token.get().strip()
         self.cfg.data["tg_chat_id"] = self.entry_tg_chat.get().strip()
-        self.cfg.data["print_engine"] = self.engine_var.get()
         self.cfg.data["foxit_path"] = self.entry_foxit.get().strip()
         self.cfg.data["rasterize_dpi"] = int(self.dpi_slider.get())
         self._store_printer_settings()

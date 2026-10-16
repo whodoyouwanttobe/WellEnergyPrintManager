@@ -70,6 +70,10 @@ PROBLEMS = {
     "service": (1, "🟠", "Требуется обслуживание"),
 }
 
+# Проблемы, при которых принтер стоит и не печатает (время печати на это время замораживаем)
+STOPPING = {"jam", "door_open", "no_ink", "no_paper", "offline", "error", "intervention",
+            "output_full", "paper_problem", "tray_missing", "manual_feed", "paused", "memory", "waste_full"}
+
 COLOR_RU = [
     (r"maint|обслуж|waste|отработ", "Картридж обслуживания"),
     (r"print\s*head|печатающ", "Печатающая головка"),
@@ -322,6 +326,7 @@ def combine(spooler=None, snmp=None, tracker=None, plotter=False):
             if k in problems and not problems[k]:
                 problems[k] = t
 
+    device_busy = busy        # что говорит сам принтер/Windows (без расчёта программы)
     # Трекер программы: задание ещё печатается по расчёту — принтер занят
     if tracker and not tracker.get("idle"):
         cur = tracker.get("current") or {}
@@ -365,7 +370,9 @@ def combine(spooler=None, snmp=None, tracker=None, plotter=False):
             details.append(f"  {mark} {s['name']}: {pct}")
     for t in driver_texts:
         details.append(f"Драйвер: {t}")
+    stopped = any(k in STOPPING for k in problems)
     return {"color": color, "text": text, "problems": problems, "busy": busy,
+            "device_busy": device_busy, "stopped": stopped,
             "details": details, "supplies": supplies}
 
 

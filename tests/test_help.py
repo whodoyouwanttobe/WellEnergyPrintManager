@@ -77,6 +77,7 @@ def _fake_app(printed):
         printed_pages={fp: printed},
         target_copies=_Copies(1),
         _execute_print=lambda f, fmt, pgs, copies=1: calls.append((fmt, list(pgs), copies)),
+        _print_done_info=lambda text: None,
     )
     return app, fp, calls
 
@@ -160,3 +161,45 @@ def test_fetch_releases_uses_etag_and_304(monkeypatch):
     second = updater.fetch_releases("o/r")
     assert first == second == [{"tag_name": "v1.0.0"}]
     assert seen == [None, '"abc"']
+
+
+# ───────────── «Печать группы» после частичной печати ─────────────
+def _group_app(printed, tc=1):
+    calls = []
+    app = types.SimpleNamespace(printed_pages={"C:/p/doc.pdf": printed}, target_copies=_Copies(tc),
+                                _execute_print=lambda f, fmt, pgs, copies=1: calls.append((fmt, list(pgs), copies)))
+    return app, calls
+
+
+def test_group_partial_yes_prints_only_missing(quiet):
+    mp, mb, _ = quiet
+    from ui.app import PrintManagerApp
+    app, calls = _group_app({1: {"printed": 2}, 2: {"printed": 1}}, tc=2)
+    asked = []
+    mp.setattr(mb, "askyesnocancel", lambda *a, **k: asked.append(a[1]) or True)
+    PrintManagerApp.print_format_group(app, "C:/p/doc.pdf", "A4", [1, 2, 3])
+    assert "3 из 6" in asked[0]
+    assert sorted(calls) == [("A4", [2], 1), ("A4", [3], 2)]     # стр.1 уже 2/2 — не печатается
+
+
+def test_group_partial_no_prints_all(quiet):
+    mp, mb, _ = quiet
+    import tkinter.simpledialog as sd
+    from ui.app import PrintManagerApp
+    app, calls = _group_app({1: {"printed": 1}})
+    mp.setattr(mb, "askyesnocancel", lambda *a, **k: False)
+    mp.setattr(sd, "askinteger", lambda *a, **k: 1)
+    PrintManagerApp.print_format_group(app, "C:/p/doc.pdf", "A4", [1, 2, 3])
+    assert calls == [("A4", [1, 2, 3], 1)]
+
+
+def test_group_cancel_and_fully_printed(quiet):
+    mp, mb, _ = quiet
+    from ui.app import PrintManagerApp
+    app, calls = _group_app({1: {"printed": 1}})
+    mp.setattr(mb, "askyesnocancel", lambda *a, **k: None)
+    PrintManagerApp.print_format_group(app, "C:/p/doc.pdf", "A4", [1, 2])
+    app2, calls2 = _group_app({1: {"printed": 1}, 2: {"printed": 1}})
+    mp.setattr(mb, "askyesno", lambda *a, **k: False)
+    PrintManagerApp.print_format_group(app2, "C:/p/doc.pdf", "A4", [1, 2])
+    assert calls == [] and calls2 == []

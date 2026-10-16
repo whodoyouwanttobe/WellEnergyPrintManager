@@ -104,3 +104,23 @@ def test_active_formats_and_pages_until_really_printed():
     tr.tick()
     assert tr.pop_changed() is True       # интерфейс обновит отметки
     assert tr.active_formats("a.pdf") == {"A1"} and tr.active_pages("a.pdf") == {4}
+
+
+def test_paper_out_freezes_timer():
+    """Кончилась бумага на 30-й секунде, заправили через 270 с — задание не «готово» по таймеру."""
+    tr, c = make()
+    j = tr.add("a.pdf", "A4", 50, 1, "HP", "laser", 100)
+    tr.start(j)
+    tr.spooled(j)
+    c.t = 30
+    tr.set_stopped("HP", True)
+    c.t = 200
+    assert tr.tick() == [] and tr.printing_now("HP")
+    frac = tr.printer_summary("HP")["fraction"]
+    assert 0.25 < frac < 0.35                    # прогресс замер на 30%
+    c.t = 300
+    tr.set_stopped("HP", False)                   # бумагу заправили
+    c.t = 360
+    assert tr.tick() == []                        # 30 + 60 = 90 с печати из 100
+    c.t = 371
+    assert tr.tick() == ["a.pdf"]

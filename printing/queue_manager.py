@@ -708,20 +708,14 @@ class PrintQueueManager:
         import win32con
         import subprocess
         
-        # 1. Find Foxit
-        foxit_path = None
-        paths = [
-            r"C:\Program Files (x86)\Foxit Software\Foxit PDF Editor\FoxitPDFEditor.exe",
-            r"C:\Program Files\Foxit Software\Foxit PDF Editor\FoxitPDFEditor.exe",
-            r"C:\Program Files (x86)\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe",
-            r"C:\Program Files\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe",
-            r"C:\Program Files (x86)\Foxit Software\Foxit Reader\FoxitReader.exe",
-            r"C:\Program Files\Foxit Software\Foxit Reader\FoxitReader.exe"
-        ]
-        for p in paths:
-            if os.path.exists(p):
-                foxit_path = p
-                break
+        # 1. Find Foxit (путь из настроек или стандартные места)
+        from core.engines import find_foxit
+        try:
+            from core.config import get_config
+            configured = get_config().get("foxit_path", "")
+        except Exception:
+            configured = ""
+        foxit_path = find_foxit(configured)
                 
         if not foxit_path:
             logging.error("Foxit not found for DevMode hack!")

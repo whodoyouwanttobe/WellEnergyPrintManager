@@ -54,7 +54,8 @@ def test_help_window_opens_tabs_search_and_topic(app):
 def test_tour_walks_steps_highlights_and_closes(app):
     tour = app.start_tour()
     pump(app, 0.5)
-    assert app.cfg.get("tour_offered") is True
+    from ui.components.tour import TOUR_VERSION
+    assert app.cfg.get("tour_seen_version") == TOUR_VERSION
     assert tour.bubble.winfo_viewable()
     assert "из" not in tour.counter_lbl.cget("text")          # приветствие
     tour.next()
@@ -70,7 +71,8 @@ def test_tour_walks_steps_highlights_and_closes(app):
     pump(app, 0.9)
     assert tour.index == 2
     # рамка ПЕРЕЕХАЛА к новому элементу (раньше на Linux/Tk оставалась на старом месте)
-    for idx, name in ((8, "plan_pane"), (12, "btn_help")):
+    for name in ("plan_pane", "btn_help"):
+        idx = next(i for i, st in enumerate(tour.steps) if st.target == name)
         tour.show(idx)
         pump(app)
         w = getattr(app, name)
@@ -81,7 +83,8 @@ def test_tour_walks_steps_highlights_and_closes(app):
     # у всех шагов с целью виджет существует в окне
     for st in tour.steps:
         if st.target:
-            assert getattr(app, st.target, None) is not None, st.target
+            w = st.target(app) if callable(st.target) else getattr(app, st.target, None)
+            assert w is not None, st.title
     tour.btn_close.invoke()     # ✕
     pump(app)
     assert app._tour is None and not tour.bubble.winfo_exists()
@@ -225,3 +228,86 @@ def test_plotter_basket_and_manual_empty(app, monkeypatch):
     assert app.trays.current("Canon TM-305") == 2
     app.tray_emptied("Canon TM-305")
     assert app.trays.current("Canon TM-305") == 0
+
+
+@needs_display
+def test_tour_topmost_on_restart_and_covers_new_topics(app):
+    t1 = app.start_tour()
+    pump(app)
+    t2 = app.start_tour()             # повторный запуск — старый закрыт, новый поверх окна
+    pump(app, 0.5)
+    assert not t1.active and t2.active
+    assert t2._top is True                # пузырь и рамка — поверх окна программы (на X11 без WM атрибут не читается)
+    text = " ".join(st.title + " " + st.text for st in t2.steps)
+    for topic in ("Печать по форматам", "Меню файла", "миниатюра", "документация", "имитация"):
+        assert topic in text, topic
+    t2.close()
+
+
+@needs_display
+def test_tour_simulates_printing(app, monkeypatch):
+    sent = []
+    monkeypatch.setattr(app.queue_manager, "add_job", lambda *a, **k: sent.append(a))
+    tour = app.start_tour()
+    idx = next(i for i, st in enumerate(tour.steps) if st.wait == "print_simulated")
+    tour.show(idx)
+    app._execute_print("C:/a.pdf", "A4", [1, 2, 3], copies=2)
+    pump(app, 0.9)
+    assert sent == []                                   # на принтер ничего не ушло
+    assert any(t.key == "tour:sim" for t in app.notifier.toasts)
+    assert app._sim_sheets == 6 and tour.index == idx + 1
+    tour.close()
+    for t in list(app.notifier.toasts):
+        t.close()
+
+
+@needs_display
+def test_two_laser_printers_choice(app):
+    app._system_printers = ["HP LaserJet Pro MFP M435 PCL 6", "HP MFP M436 PCL6", "Canon TM-305", "PDF"]
+    app.cfg.data["laser_printers"] = ["HP LaserJet Pro MFP M435 PCL 6", "HP MFP M436 PCL6"]
+    app.cfg.data.setdefault("printers", {}).setdefault("plotter", {})["name"] = "Canon TM-305"
+    app.apply_printer_setup()
+    assert list(app.laser_combo.cget("values")) == ["HP LaserJet Pro MFP M435 PCL 6", "HP MFP M436 PCL6"]
+    assert app._current_laser == "HP LaserJet Pro MFP M435 PCL 6"
+    assert app.plotter_printer_var.get() == "Canon TM-305"
+    app._on_laser_changed("HP MFP M436 PCL6")
+    assert app._current_laser == "HP MFP M436 PCL6" and "Опрос" in app.laser_status_lbl.cget("text")
+
+
+@needs_display
+def test_settings_printers_and_engines_tabs(app):
+    app._system_printers = ["HP A", "HP B", "Canon TM-305"]
+    app.open_settings()
+    pump(app)
+    dlg = app._settings_dlg
+    rows = dlg._device_rows
+    rows[0][1].set("HP A")
+    rows[1][1].set("HP B")
+    rows[2][1].set("Canon TM-305")
+    rows[1][2].insert(0, "10.0.0.7")
+    assert "Foxit" in dlg.foxit_status.cget("text")
+    assert not hasattr(dlg, "engine_var")              # выбора движка больше нет
+    dlg.save()
+    pump(app)
+    assert app.cfg.get("laser_printers") == ["HP A", "HP B"]
+    assert app.cfg.get("printer_hosts")["HP B"] == "10.0.0.7"
+    assert list(app.laser_combo.cget("values")) == ["HP A", "HP B"]
+
+
+@needs_display
+def test_paper_out_keeps_tray_counter_and_blocks_pause(app):
+    app._current_laser = "HP M436"
+    app.trays.set("HP M436", 150)
+    tid = app.print_tracker.add("a.pdf", "A4", 50, 1, "HP M436", "laser", 1)
+    app.print_tracker.start(tid)
+    app.print_tracker.spooled(tid)
+    app._apply_printer_state("laser", "HP M436", {"status": 0x10, "jobs": [{"Status": 0x40}]}, None, None)
+    import time
+    time.sleep(1.2)                                # по расчёту задание уже «напечатано»…
+    app.print_tracker.tick()
+    assert not app._printer_finished("HP M436")    # …но принтер стоит без бумаги — окно не показываем
+    assert app.trays.current("HP M436") == 150     # счётчик лотка не сбился и не обнулился
+    app._apply_printer_state("laser", "HP M436", {"status": 0, "jobs": []}, None, None)
+    assert app.trays.current("HP M436") == 150
+    for t in list(app.notifier.toasts):
+        t.close()

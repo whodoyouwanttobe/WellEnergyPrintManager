@@ -21,6 +21,7 @@ class PrintTracker:
         self._ids = itertools.count(1)
         self.jobs = {}          # id -> dict
         self.changed = False    # было ли изменение состояния заданий с прошлого tick()
+        self._stopped = {}      # принтер -> когда остановился (нет бумаги, замятие…)
 
     # ───────────── события ─────────────
     def add(self, filepath, fmt, pages, copies, printer, kind, est_seconds, page_list=None):
@@ -58,13 +59,34 @@ class PrintTracker:
             j["state"], j["finished"] = "error", self._clock()
             self.changed = True
 
+    def set_stopped(self, printer, stopped):
+        """Принтер встал (нет бумаги, замятие, открыта крышка…) или снова пошёл.
+        Пока стоит, расчётное время печати его заданий не идёт: иначе задание считалось бы
+        «напечатанным» по таймеру, хотя листы ещё не вышли, и окно «Заберите листы»
+        или отметка «готово» появились бы раньше времени."""
+        now = self._clock()
+        if stopped and printer not in self._stopped:
+            self._stopped[printer] = now
+        elif not stopped and printer in self._stopped:
+            delta = now - self._stopped.pop(printer)
+            for j in list(self.jobs.values()):
+                if j["printer"] == printer and j["state"] in ("sending", "printing") and j["started"] is not None:
+                    j["started"] += delta
+
+    def is_stopped(self, printer):
+        return printer in self._stopped
+
+    def _now_for(self, printer, now):
+        return self._stopped.get(printer, now)
+
     def tick(self):
         """Переводит в «готово» задания, чьё ориентировочное время печати истекло.
         Возвращает список файлов, по которым печать полностью закончилась."""
         now = self._clock()
         touched = set()
         for j in self.jobs.values():
-            if j["state"] == "printing" and now >= j["started"] + j["est"]:
+            if j["state"] == "printing" and j["printer"] not in self._stopped \
+                    and now >= j["started"] + j["est"]:
                 j["state"], j["finished"] = "done", now
                 touched.add(j["file"])
                 self.changed = True
@@ -112,8 +134,9 @@ class PrintTracker:
         Вызывается и из потока очереди печати — поэтому работаем со снимком."""
         for _ in range(3):
             try:
-                return any(j["printer"] == printer and j["state"] in ("sending", "printing")
-                           for j in list(self.jobs.values()))
+                return printer in self._stopped or any(
+                    j["printer"] == printer and j["state"] in ("sending", "printing")
+                    for j in list(self.jobs.values()))
             except RuntimeError:
                 continue
         return False
@@ -143,6 +166,7 @@ class PrintTracker:
             return 1.0
         if j["state"] == "queued" or j["started"] is None:
             return 0.0
+        now = self._now_for(j["printer"], now)
         frac = (now - j["started"]) / j["est"]
         if j["total"]:
             frac = max(frac, j["printed"] / j["total"] * 0.9)
