@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Сборка (exe собирает GitHub Actions и кладёт в Releases)
+build/
+dist/
+*.spec
+
+# Личные/рабочие данные — НЕ в репозиторий
+print_config.json
+config_for_laptop.json
+*.db
+*.log
+.env
+*.pdf
+*.png
+!ui/assets/*.png
+*.xlsx
+*.csv
+Отчет_*
+wpm_selftest_result.txt
+
+# Старые копии проекта и exe (по 67 МБ) — не в репозиторий
+history/
+*.exe
+!tools/SumatraPDF.exe
+!tools/PDFtoPrinter.exe
+.git_old_backup/
+
+# Черновики и бэкапы
+scratch/
+_backup_*/
+*.bak
+.gemini/
+.tempmediaStorage/
+
+# Инструменты печати НУЖНЫ в репозитории (CI кладёт их в exe), кэш — нет
+tools/sumatrapdfcache/
