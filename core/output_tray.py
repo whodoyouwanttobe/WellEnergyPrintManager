@@ -91,19 +91,83 @@ def plan_job(n_pages, copies, fill, capacity, slot=1):
 
 
 class TrayCounter:
-    """Сколько листов будет лежать в лотке каждого принтера после всех заданий в очереди
-    (по расчёту, с учётом запланированных пауз). Сам по себе счётчик НЕ обнуляется:
-    только когда вы подтвердили, что лоток пуст (ОК в окне «Заберите листы» или
-    «Я забрал листы» в меню значка принтера)."""
+    """Два счётчика на каждый принтер:
 
-    def __init__(self):
-        self.fill = {}             # принтер -> занято мест
+    • planned — сколько будет лежать в лотке после всех заданий в очереди (с учётом
+      запланированных пауз). По нему ставятся паузы. Новое задание (файл, группа,
+      страница) ПРИБАВЛЯЕТСЯ к нему, а не начинает счёт заново.
+    • in_tray — сколько лежит сейчас: растёт, когда задание реально допечатано.
+      Это число показывается рядом с состоянием принтера.
 
+    Сами по себе счётчики не обнуляются — только когда вы подтвердили, что лоток пуст
+    (ОК в окне «Заберите листы» или щелчок по индикатору лотка). Значения сохраняются
+    в настройках и переживают перезапуск программы.
+    """
+
+    def __init__(self, saved=None, on_change=None):
+        saved = saved or {}
+        self.fill = {k: float(v.get("planned", 0)) for k, v in saved.items() if isinstance(v, dict)}
+        self.now = {k: float(v.get("in_tray", 0)) for k, v in saved.items() if isinstance(v, dict)}
+        self.on_change = on_change
+
+    def _changed(self, printer):
+        if self.on_change:
+            try:
+                self.on_change(printer)
+            except Exception:
+                pass
+
+    def to_dict(self):
+        names = set(self.fill) | set(self.now)
+        return {n: {"planned": self.fill.get(n, 0), "in_tray": self.now.get(n, 0)} for n in names}
+
+    # — планирование —
     def current(self, printer):
         return self.fill.get(printer, 0)
 
     def set(self, printer, value):
         self.fill[printer] = max(0, round(float(value), 2))
+        self._changed(printer)
 
-    def emptied(self, printer):
+    # — что лежит сейчас —
+    def in_tray(self, printer):
+        return self.now.get(printer, 0)
+
+    def delivered(self, printer, amount):
+        """Задание реально допечатано — листы легли в лоток."""
+        self.now[printer] = round(self.now.get(printer, 0) + max(0.0, float(amount)), 2)
+        self._changed(printer)
+
+    def pause_ok(self, printer):
+        """ОК в окне «Заберите листы»: лоток пуст. planned уже учитывает эту паузу."""
+        self.now[printer] = 0
+        self._changed(printer)
+
+    def set_in_tray(self, printer, amount):
+        """Вы указали вручную, сколько лежит (или 0 — забрал всё без окна)."""
+        amount = max(0.0, float(amount))
+        removed = self.now.get(printer, 0) - amount
+        self.now[printer] = round(amount, 2)
+        if removed > 0:   # забрали часть листов — в плане их тоже больше нет
+            self.fill[printer] = max(0, round(self.fill.get(printer, 0) - removed, 2))
+        self._changed(printer)
+
+    def reset(self, printer):
+        """Очередь снята (Отмена у паузы) и лоток пуст."""
         self.fill[printer] = 0
+        self.now[printer] = 0
+        self._changed(printer)
+
+    def sync_idle(self, printer):
+        """Принтер ничего не печатает и очередь пуста: в лотке ровно то, что напечатано."""
+        if abs(self.fill.get(printer, 0) - self.now.get(printer, 0)) > 0.01:
+            self.fill[printer] = self.now.get(printer, 0)
+            self._changed(printer)
+
+    def emptied(self, printer, idle=True):
+        """Вы забрали листы. Если принтер ничего не печатает — лоток пуст полностью;
+        если печатает — из плана убираем только то, что уже лежало."""
+        if idle:
+            self.reset(printer)
+        else:
+            self.set_in_tray(printer, 0)

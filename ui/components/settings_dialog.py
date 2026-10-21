@@ -80,6 +80,13 @@ class SettingsDialog(tk.Toplevel):
                      "помечаются ⚡ и на плоттере растеризуются перед печатью. Повторный анализ не нужен.",
                      font=("Segoe UI", 10), text_color="gray", wraplength=350, justify="left").grid(
             row=4, column=0, columnspan=2, padx=10, pady=(2, 10), sticky="w")
+
+        self.explorer_var = ctk.BooleanVar(master=self, value=bool(self.cfg.get("explorer_menu", True)))
+        ctk.CTkCheckBox(self.tab_general, text="Пункт «Напечатать в WPM» в меню Проводника (правый клик по папке/PDF)",
+                        variable=self.explorer_var).grid(row=5, column=0, columnspan=2, padx=10, pady=(4, 2), sticky="w")
+        ctk.CTkLabel(self.tab_general, text="В Windows 11 пункт — в «Показать дополнительные параметры» "
+                     "(или Shift + правый клик).", font=("Segoe UI", 10), text_color="gray").grid(
+            row=6, column=0, columnspan=2, padx=10, pady=(0, 8), sticky="w")
         
     CHANNELS = {"Стабильная (рабочая)": "stable", "Бета (тестирование)": "beta", "Разработка (dev)": "dev"}
 
@@ -403,6 +410,9 @@ class SettingsDialog(tk.Toplevel):
         self.cfg.data["foxit_path"] = self.entry_foxit.get().strip()
         self.cfg.data["rasterize_dpi"] = int(self.dpi_slider.get())
         self._store_printer_settings()
+        self.cfg.data["explorer_menu"] = bool(self.explorer_var.get())
+        if hasattr(self.master, "_sync_explorer_menu"):
+            self.master.after(20, self.master._sync_explorer_menu)
         try:
             self.cfg.data["heavy_ops_threshold"] = max(int(float(self.entry_heavy.get().replace(",", "."))), 1) * 1000
         except ValueError:

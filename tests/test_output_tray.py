@@ -85,3 +85,36 @@ def test_pause_waits_until_really_printed():
         time.sleep(0.05)
     qm.stop()
     assert shown and shown[0] - t0 >= 0.7       # окно — только после окончания печати
+
+
+def test_new_jobs_add_to_counter_and_runtime_fill():
+    c = TrayCounter()
+    steps, fill = plan_job(50, 1, c.current("HP"), 200)
+    c.set("HP", fill)
+    steps, fill = plan_job(30, 1, c.current("HP"), 200)       # следующая страница/группа
+    c.set("HP", fill)
+    assert c.current("HP") == 80 and c.in_tray("HP") == 0     # в плане 80, напечатано пока 0
+    c.delivered("HP", 50)
+    assert c.in_tray("HP") == 50
+    c.set_in_tray("HP", 0)                                     # забрал 50 л. во время печати
+    assert c.in_tray("HP") == 0 and c.current("HP") == 30      # в плане остались ещё 30
+    c.delivered("HP", 30)
+    c.pause_ok("HP")
+    assert c.in_tray("HP") == 0
+
+
+def test_counter_persists():
+    saved = {}
+    c = TrayCounter(on_change=lambda p: saved.update(c.to_dict()))
+    c.set("Canon", 5)
+    c.delivered("Canon", 3)
+    c2 = TrayCounter(saved)
+    assert c2.current("Canon") == 5 and c2.in_tray("Canon") == 3
+
+
+def test_sync_idle_fixes_drift():
+    c = TrayCounter()
+    c.set("HP", 120)
+    c.delivered("HP", 100)            # 20 л. не допечатались (ошибка задания)
+    c.sync_idle("HP")
+    assert c.current("HP") == 100

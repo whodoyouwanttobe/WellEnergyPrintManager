@@ -645,14 +645,16 @@ class PrintQueueManager:
                     elif p_status & win32print.PRINTER_STATUS_ERROR:
                         error_msg = "Возможная ошибка принтера"
                         
+                    # Сообщения о бумаге/замятии/ошибках показывает монитор принтеров в окне
+                    # (с проверкой по сети и без ложных «возможных ошибок»). Здесь — только журнал.
+                    # Раньше при любом флаге ошибки в очереди Windows (у HP он часто «залипает»
+                    # после заправки бумаги) каждые 10 с всплывала «Возможная ошибка принтера»,
+                    # а проверка самого задания пропускалась.
                     if error_msg:
                         current_time = time.time()
-                        if current_time - last_alert_time > 10:
-                            if hasattr(self, 'on_printer_alert') and self.on_printer_alert:
-                                self.on_printer_alert(printer_name, error_msg)
+                        if current_time - last_alert_time > 60:
+                            logging.info(f"[Spooler] {printer_name}: {error_msg} (флаг очереди Windows)")
                             last_alert_time = current_time
-                        time.sleep(2) # Wait before checking again
-                        continue
                         
                 except Exception as e:
                     logging.error(f"Failed to check printer status: {e}")

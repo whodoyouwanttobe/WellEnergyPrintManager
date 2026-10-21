@@ -55,6 +55,10 @@ if __name__ == "__main__":
         from ui.selftest import main_self_test
         sys.exit(main_self_test(sys.argv[1:]))
     
+    # «Напечатать в WPM» из меню Проводника: WPM.exe --print "C:\Папка" (или PDF)
+    from core.shell_integration import parse_print_arg
+    print_request = parse_print_arg(sys.argv[1:])
+
     # Только один экземпляр: два одновременно запущенных WPM дважды анализируют папку
     # и могут дважды отправить одно и то же на печать.
     _instance_mutex = None
@@ -63,6 +67,11 @@ if __name__ == "__main__":
             _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
             _instance_mutex = _k32.CreateMutexW(None, False, "Local\\WellEnergyPrintManager")
             if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+                if print_request:
+                    # Программа уже открыта — передаём ей путь, она сама покажет окно печати
+                    from core.print_request import write_request
+                    write_request(print_request)
+                    sys.exit(0)
                 import tkinter as _tk
                 from tkinter import messagebox as _mb
                 _r = _tk.Tk(); _r.withdraw()
@@ -105,7 +114,9 @@ if __name__ == "__main__":
         from core.version import FULL_VERSION
         logging.info(f"Запуск WPM {FULL_VERSION}, exe: {sys.executable}")
         from ui.app import PrintManagerApp
-        app = PrintManagerApp(splash=splash)
+        if print_request:
+            logging.info(f"Запуск из Проводника: печать {print_request}")
+        app = PrintManagerApp(splash=splash, print_request=print_request)
         logging.info("Главное окно создано")
         app.mainloop()
         logging.info("Программа закрыта")

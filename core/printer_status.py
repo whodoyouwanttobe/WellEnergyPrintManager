@@ -279,6 +279,11 @@ def combine(spooler=None, snmp=None, tracker=None, plotter=False):
             problems[k] = ""
     supplies = []
     if snmp:
+        # Принтер ответил по сети — по «железу» (бумага, замятие, чернила, крышка) верим ему,
+        # а не флагам очереди Windows: у HP они часто остаются после того, как бумагу уже
+        # заправили. Очередь оставляем только для «отключен» и «пауза».
+        for k in [k for k in problems if k not in ("offline", "paused")]:
+            problems.pop(k)
         for k in decode_hr_errors(snmp.get("errors")):
             problems.setdefault(k, "")
         supplies = snmp.get("supplies") or []

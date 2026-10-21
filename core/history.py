@@ -124,6 +124,20 @@ class PrintHistory:
         except Exception as e:
             log.error(f"DB add_printed error: {e}")
 
+    def unprint_pages(self, filepath, pages_list, copies, fmt=""):
+        """Снять отметки (печать была прервана, листы не вышли): copies -= N, не ниже 0."""
+        try:
+            with db_connect(self.db_path) as conn:
+                c = conn.cursor()
+                for p in pages_list:
+                    c.execute("UPDATE printed_pages SET copies = MAX(0, copies - ?) "
+                              "WHERE filepath = ? AND page_number = ?", (int(copies), filepath, p))
+                conn.commit()
+            for p in pages_list:
+                self._log_transaction(filepath, p, "unprint", int(copies), fmt)
+        except Exception as e:
+            log.error(f"DB remove_printed error: {e}")
+
     def get_all_printed(self, folder):
         """Returns dict: {filepath: {page_number: {"printed": copies, "folded": folded}}} for all files in a folder"""
         res = {}

@@ -9,6 +9,7 @@ import traceback
 from core.config import get_config, get_base_path
 from core.version import APP_VERSION, APP_TITLE
 from ui.components.dialog_utils import open_dialog
+from ui.components import choice_dialog
 from core.analyzer import ScanJob
 from core.analysis_cache import AnalysisCache
 from core.timefmt import short_time, long_time
@@ -35,8 +36,17 @@ class _CopiesVar(ctk.StringVar):
 
 
 class PrintManagerApp(ctk.CTk):
-    def __init__(self, splash=None):
+    def __init__(self, splash=None, print_request=None):
         super().__init__()
+        self._print_request = print_request     # «Напечатать в WPM» из Проводника при запуске
+        self._quick_dialog = None
+        self._quick_session = None
+        self._qp_scan = None           # фоновый анализ для окна «Напечатать в WPM»
+        self._qp_scan_queue = []
+        self._job_data = {}            # анализ файлов из заданий (могут быть не из открытой папки)
+        self.tasks = []                # «Очередь заданий» внизу окна
+        self._task_ids = None
+        self._select_after_scan = None
         # ГЛАВНАЯ ПРИЧИНА ПУСТЫХ ОКОН: заставка (main.py) — это отдельный tk.Tk(), созданный
         # раньше, поэтому tkinter считал «корнем по умолчанию» именно её. После splash.destroy()
         # корня по умолчанию не остаётся, и CustomTkinter не может создать шрифт (CTkFont) в
@@ -117,7 +127,8 @@ class PrintManagerApp(ctk.CTk):
         self.print_start_time = 0
         self.print_tracker = PrintTracker()   # ход печати по принтерам (полосы прогресса)
         from core.output_tray import TrayCounter
-        self.trays = TrayCounter()             # сколько листов лежит в лотке выдачи каждого принтера
+        # сколько листов лежит в лотке выдачи каждого принтера (сохраняется между запусками)
+        self.trays = TrayCounter(self.cfg.get("tray_fill", {}) or {}, on_change=self._on_tray_changed)
         self._had_print_activity = False
         
         self._file_times = {}   # печать в текущем сеансе: {fp: {"start": datetime, "end": datetime}}
@@ -125,6 +136,7 @@ class PrintManagerApp(ctk.CTk):
         
         self._tour = None       # активное обучение (ui/components/tour.py)
         self._build_ui()
+        self._bind_hotkeys()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._start_printer_monitoring()
         self._check_updates_startup()
@@ -137,7 +149,19 @@ class PrintManagerApp(ctk.CTk):
         # пока висит заставка) — в 4.9.0 окно из-за этого «пропадало» сразу после заставки,
         # хотя программа продолжала работать в фоне.
         self.after(100, self._close_splash)
-        if self.current_folder and os.path.isdir(self.current_folder):
+        # Печать, прерванная в прошлый раз (программа закрылась или ПК выключился посреди печати)
+        import uuid
+        self._session_id = uuid.uuid4().hex[:8]
+        self._stale_inflight = list(self.cfg.get("inflight_jobs", []) or [])
+        if self._stale_inflight:
+            self.cfg.set("inflight_jobs", [])
+            self.after(3000, self._ask_stale_inflight)
+        self.after(1000, self._poll_print_request)
+        if self._print_request:
+            # если выделили несколько PDF, остальные файлы приходят запросами за долю секунды —
+            # ждём чуть дольше и собираем их в одно окно
+            self.after(900, self._start_quick_from_launch)
+        elif self.current_folder and os.path.isdir(self.current_folder):
             self.after(300, self.start_analysis)
         elif self.current_folder:
             self.status_label.configure(text=f"Папка недоступна: {self.current_folder}")
@@ -156,9 +180,17 @@ class PrintManagerApp(ctk.CTk):
             self.focus_force()
         except Exception:
             pass
-        # Первый запуск — предложить обучение (один раз)
+        # Перетаскивание папки/PDF в окно и пункт в меню Проводника (только Windows)
+        try:
+            from ui.dnd_win import enable_drop
+            enable_drop(self, self._on_drop)
+        except Exception:
+            logging.exception("Перетаскивание")
+        self._sync_explorer_menu()
+        # Первый запуск — предложить обучение (один раз). При печати из Проводника — не мешаем.
         from ui.components.tour import TOUR_VERSION
-        if int(self.cfg.get("tour_seen_version", 0) or 0) < TOUR_VERSION and not os.environ.get("WPM_NO_TOUR"):
+        if int(self.cfg.get("tour_seen_version", 0) or 0) < TOUR_VERSION and not os.environ.get("WPM_NO_TOUR") \
+                and not self._print_request:
             self.after(1500, lambda: self.start_tour(offer=True))
     # ───────────── потокобезопасность и ошибки ─────────────
     def ui_call(self, fn, *args):
@@ -246,6 +278,7 @@ class PrintManagerApp(ctk.CTk):
         self.after(8000, self._flush_reports_later)  # отчёты, не отправленные в прошлый раз
         self.after(self.UPDATE_CHECK_INTERVAL_MS, self._periodic_update_check)
         self.after(3000, self._update_watchdog)
+        self.after(2500, self._verify_update_install)
 
     def _periodic_update_check(self):
         if self._update_state in (None, "available"):
@@ -278,6 +311,8 @@ class PrintManagerApp(ctk.CTk):
             return  # уже занимаемся обновлением
         self._update_info = info
         self._update_state = "available"
+        from core.version import FULL_VERSION
+        logging.info("Найдено обновление %s (установлена %s)", info["version"], FULL_VERSION)
         self._show_update_button(f"⬆ Обновление {info['version'].lstrip('v')}")
         # Окно — только сразу после запуска (и если не идёт печать) или по ручной проверке
         if manual or (startup and self._print_busy_jobs() == 0 and getattr(self, "_tour", None) is None):
@@ -364,6 +399,7 @@ class PrintManagerApp(ctk.CTk):
     def _install_now(self):
         from core.updater import install_update
         try:
+            self._remember_pending_update()
             install_update(self._update_exe, restart=True)
         except Exception as e:
             messagebox.showinfo("Обновление", str(e), parent=self)
@@ -371,6 +407,33 @@ class PrintManagerApp(ctk.CTk):
             return
         self._update_state = "installing"
         self._on_close()
+
+    def _remember_pending_update(self):
+        """Запомнить, какую версию ставим: после перезапуска проверим, что она действительно запустилась."""
+        try:
+            self.cfg.set("pending_update_tag", (self._update_info or {}).get("version", ""))
+        except Exception:
+            pass
+
+    def _verify_update_install(self):
+        """Если после обновления запустилась НЕ та версия — сказать об этом (раньше снова молча
+        появлялась кнопка «Обновление», и было непонятно, почему)."""
+        from core.updater import parse_tag, current_parsed
+        from core.version import FULL_VERSION
+        pending = self.cfg.get("pending_update_tag") or ""
+        if not pending:
+            return
+        self.cfg.set("pending_update_tag", "")
+        p = parse_tag(pending)
+        if p and p != current_parsed():
+            logging.error("Обновление до %s не установилось: запущена %s", pending, FULL_VERSION)
+            messagebox.showwarning(
+                "Обновление",
+                f"Обновление до {pending.lstrip('v')} не установилось — запущена версия {FULL_VERSION}.\n\n"
+                "Скорее всего, файл программы был занят. Закройте все окна программы и нажмите "
+                "«⬆ Обновление» ещё раз. Если повторится — «Сообщить об ошибке».", parent=self)
+        else:
+            logging.info("Обновление до %s установлено", pending)
 
     def _update_watchdog(self):
         """Раз в 3 с: если обновление ждёт окончания печати и печать закончилась — ставим."""
@@ -389,6 +452,7 @@ class PrintManagerApp(ctk.CTk):
         if getattr(self, "_update_state", None) in ("ready", "scheduled") and self._update_exe:
             try:
                 from core.updater import install_update
+                self._remember_pending_update()
                 install_update(self._update_exe, restart=False)
             except Exception as e:
                 logging.info(f"Обновление при закрытии не установлено: {e}")
@@ -423,6 +487,8 @@ class PrintManagerApp(ctk.CTk):
         self._printer_states = {}      # имя -> итоговое состояние (core.printer_status.combine)
         self._printer_tips = {"laser": "", "plotter": ""}
         self._notified_minor = set()   # «мало чернил» и т.п. — сообщаем один раз за сеанс
+        self._notified = {}            # принтер -> {проблема: подробность}, о которых уже сообщили
+        self._problem_since = {}       # принтер -> {проблема: когда появилась}
         self.printer_probe = PrinterProbe(
             get_overrides=lambda: self.cfg.get("printer_hosts", {}) or {},
             community=self.cfg.get("snmp_community", "public") or "public",
@@ -460,7 +526,7 @@ class PrintManagerApp(ctk.CTk):
             pass
 
     def _apply_printer_state(self, role, name, spooler, snmp, host):
-        from core.printer_status import combine, new_problems, resolved_problems, PROBLEMS
+        from core.printer_status import combine, PROBLEMS
         if name != getattr(self, "_current_laser" if role == "laser" else "_current_plotter", None):
             return   # пока опрашивали, принтер в списке сменили
         # Опрос не удался (нет связи с очередью и принтером) — это не «всё устранено»:
@@ -491,16 +557,31 @@ class PrintManagerApp(ctk.CTk):
 
         if spooler is None and snmp is None:
             return       # без данных не решаем, что проблемы устранены
-        # Уведомления: только о НОВЫХ проблемах и об их устранении
-        prev = self._printer_states.get(name)
-        old = prev["problems"] if prev else {}
+        # Уведомления: только о НОВЫХ проблемах и об их устранении.
+        # Общие «ошибка»/«нужно действие» по флагам Windows часто мигают и «залипают» —
+        # о них сообщаем, только если держатся 20+ секунд.
+        import time as _time
+        DEBOUNCE = {"error": 20, "intervention": 20, "paper_problem": 20}
         self._printer_states[name] = st
+        notified = self._notified.setdefault(name, {})
+        since = self._problem_since.setdefault(name, {})
+        now_t = _time.monotonic()
+        for k in list(since):
+            if k not in st["problems"]:
+                since.pop(k)
+        for k in st["problems"]:
+            since.setdefault(k, now_t)
         busy = bool(tracker and not tracker.get("idle")) or bool((spooler or {}).get("jobs"))
         who = ("Принтер" if role == "laser" else "Плоттер") + f" «{name}»"
-        for key, extra in new_problems(old, st["problems"]):
+        for key, extra in sorted(st["problems"].items(), key=lambda kv: -PROBLEMS[kv[0]][0]):
             sev, _c, title = PROBLEMS[key]
+            if key in notified and (notified[key] == extra or key not in ("no_ink", "low_ink", "no_paper")):
+                continue
+            if now_t - since[key] < DEBOUNCE.get(key, 0):
+                continue
             if key in ("offline", "paused") and not busy:
                 continue            # выключенный принтер без заданий — не повод всплывать
+            notified[key] = extra
             if sev <= 1:
                 tag = (name, key, extra)
                 if tag in self._notified_minor:
@@ -513,34 +594,81 @@ class PrintManagerApp(ctk.CTk):
             self.notifier.show(f"{name}:{key}", f"{PROBLEMS[key][1]} {who}", text, severity=sev)
             self.status_label.configure(text=f"⚠ {who}: {text.splitlines()[0]}",
                                         text_color="#e74c3c" if sev >= 3 else "#f39c12")
-        for key in resolved_problems(old, st["problems"]):
+        had = bool(notified)
+        for key in [k for k in notified if k not in st["problems"]]:
+            notified.pop(key)
             self.notifier.close(f"{name}:{key}")
-            self.notifier.show(f"{name}:{key}:ok", f"✓ {who}", f"Устранено: {PROBLEMS[key][2]}", severity=0)
-        if old and not any(PROBLEMS[k][0] >= 2 for st2 in self._printer_states.values() for k in st2["problems"]):
+            if PROBLEMS[key][0] >= 2:
+                self.notifier.show(f"{name}:{key}:ok", f"✓ {who}", f"Устранено: {PROBLEMS[key][2]}", severity=0)
+        if had and not any(PROBLEMS[k][0] >= 2 for st2 in self._printer_states.values() for k in st2["problems"]):
             if str(self.status_label.cget("text")).startswith("⚠"):
                 self.status_label.configure(text="✓ Принтеры в порядке", text_color="#2ecc71")
 
     def _printer_menu(self, role, event):
         import tkinter as tk
         name = getattr(self, "_current_laser" if role == "laser" else "_current_plotter", "")
+        what = "лоток" if role == "laser" else "корзину"
         m = tk.Menu(self, tearoff=0)
-        m.add_command(label="Я забрал листы — лоток пуст", command=lambda: self.tray_emptied(name))
+        m.add_command(label=f"Я забрал листы — {what} пуст{'' if role == 'laser' else 'а'}",
+                      command=lambda: self.tray_emptied(name))
+        m.add_command(label="Указать, сколько лежит сейчас…", command=lambda: self._ask_tray_amount(role, name))
         m.tk_popup(event.x_root, event.y_root)
+
+    def _ask_tray_amount(self, role, name):
+        from tkinter import simpledialog
+        unit = "листов" if role == "laser" else "листов (в пересчёте на A2)"
+        v = simpledialog.askfloat("Лоток", f"Сколько сейчас лежит, {unit}?", parent=self,
+                                  initialvalue=self.trays.in_tray(name), minvalue=0)
+        if v is not None and name:
+            self.trays.set_in_tray(name, v)
+
+    def _on_tray_changed(self, printer):
+        try:
+            self.cfg.set("tray_fill", self.trays.to_dict())
+        except Exception:
+            pass
+        if hasattr(self, "laser_tray_lbl"):
+            self._refresh_tray_labels()
+
+    def _refresh_tray_labels(self):
+        for role, lbl in (("laser", getattr(self, "laser_tray_lbl", None)),
+                          ("plotter", getattr(self, "plotter_tray_lbl", None))):
+            if lbl is None:
+                continue
+            name = getattr(self, "_current_laser" if role == "laser" else "_current_plotter", "")
+            cap = self._tray_capacity(role)
+            if not cap or not name or name in ("Default Printer", "Загрузка..."):
+                lbl.configure(text="")
+                continue
+            now = self.trays.in_tray(name)
+            queued = max(0.0, self.trays.current(name) - now)
+            pct = now / cap
+            color = "#2ecc71" if pct < 0.6 else ("#f39c12" if pct < 0.9 else "#e74c3c")
+            icon = "📥" if role == "laser" else "🧺"
+            txt = f"{icon} {now:g}/{cap}"
+            if queued >= 0.5:
+                txt += f" (+{queued:g})"
+            lbl.configure(text=txt, text_color=color)
 
     def tray_emptied(self, name):
         """Ручное подтверждение, что лоток/корзина пусты (счётчик сам не обнуляется)."""
         if name:
-            self.trays.emptied(name)
+            q = self.queue_manager.queues.get(name)
+            idle = not self.print_tracker.printing_now(name) and not (q and q.unfinished_tasks)
+            self.trays.emptied(name, idle=idle)
             self.status_label.configure(text=f"Лоток «{name}»: отмечен пустым", text_color="#2ecc71")
+            self._refresh_tray_labels()
 
     def _tray_line(self, role, name):
         cap = self._tray_capacity(role)
         if not cap:
             return "Лоток выдачи: без учёта"
-        fill = self.trays.fill.get(name, 0)
+        now = self.trays.in_tray(name)
+        queued = max(0.0, self.trays.current(name) - now)
+        extra = f", ещё ≈{queued:g} в очереди" if queued >= 0.5 else ""
         if role == "plotter":
-            return f"Корзина (по расчёту): ≈{fill:g} из {cap} л. A2 · правый клик — «забрал листы»"
-        return f"Лоток выдачи (по расчёту): ≈{fill:g} из {cap} л. до паузы · правый клик — «забрал листы»"
+            return f"Корзина: лежит ≈{now:g} из {cap} (в листах A2){extra} · щелчок по 🧺 — «забрал листы»"
+        return f"Лоток выдачи: лежит ≈{now:g} из {cap} л. до паузы{extra} · щелчок по 📥 — «забрал листы»"
 
     def _show_printer_tip(self, role, widget):
         text = self._printer_tips.get(role) or "Состояние ещё не получено"
@@ -604,7 +732,7 @@ class PrintManagerApp(ctk.CTk):
         toolbar = ctk.CTkFrame(self)
         toolbar.pack(fill="x", padx=10, pady=5)
         
-        btn_open = ctk.CTkButton(toolbar, text="Открыть папку", command=self.open_folder)
+        btn_open = ctk.CTkButton(toolbar, text="📂 Открыть папку", command=self.open_folder)
         btn_open.pack(side="left", padx=5, pady=5)
         self.btn_open = btn_open
         
@@ -614,19 +742,18 @@ class PrintManagerApp(ctk.CTk):
         copies_entry.bind("<KeyRelease>", self._on_copies_changed)
         self.copies_entry = copies_entry
         
-        btn_bug = ctk.CTkButton(toolbar, text="Сообщить об ошибке", fg_color="#b71c1c", hover_color="#d32f2f", command=self._open_bug_report)
-        btn_bug.pack(side="left", padx=(20, 5), pady=5)
-        self.btn_bug = btn_bug
+        # «Сообщить об ошибке» теперь в меню «?» (раньше красная кнопка отвлекала от «Открыть папку»)
+        self.btn_bug = copies_entry
         # Значок обновления — появляется, только когда есть новая версия
         self.btn_update = ctk.CTkButton(toolbar, text="", fg_color="#e67e22", hover_color="#d35400",
                                         command=self.show_update_dialog)
         
         # Справка и обучение — справа
         self.btn_help = ctk.CTkButton(toolbar, text="?", width=34, font=("Segoe UI", 14, "bold"),
-                                      fg_color="#5d6d7e", hover_color="#85929e", command=self.open_help)
+                                      fg_color="#5d6d7e", hover_color="#85929e", command=self._help_menu)
         self.btn_help.pack(side="right", padx=(2, 5), pady=5)
         self.btn_tour = ctk.CTkButton(toolbar, text="🎓 Обучение", width=100, fg_color="#5d6d7e",
-                                      hover_color="#85929e", command=self.start_tour)
+                                      hover_color="#85929e", command=lambda: self.start_tour(mode="quick"))
         self.btn_tour.pack(side="right", padx=2, pady=5)
         btn_settings = ctk.CTkButton(toolbar, text="Настройки", width=100, command=self.open_settings)
         btn_settings.pack(side="right", padx=5, pady=5)
@@ -667,6 +794,7 @@ class PrintManagerApp(ctk.CTk):
         
         def _on_plotter_changed(v):
             self.plotter_status_lbl.configure(text="⚪ Опрос…")
+            self.after(10, self._refresh_tray_labels)
             if hasattr(self, "_printer_tips"):
                 self._printer_tips["plotter"] = ""
             self._current_plotter = v
@@ -688,6 +816,7 @@ class PrintManagerApp(ctk.CTk):
             self._current_laser = v
             # состояние показываем для выбранного принтера — старое сразу убираем
             self.laser_status_lbl.configure(text="⚪ Опрос…")
+            self.after(10, self._refresh_tray_labels)
             if hasattr(self, "_printer_tips"):
                 self._printer_tips["laser"] = ""
             printers_cfg = self.cfg.get("printers", {})
@@ -700,6 +829,15 @@ class PrintManagerApp(ctk.CTk):
         self.laser_combo = ctk.CTkOptionMenu(toolbar, variable=self.laser_printer_var, values=printers, width=130, command=_on_laser_changed)
         self.laser_combo.pack(side="right", padx=(5, 0), pady=5)
         ctk.CTkLabel(toolbar, text="Принтер:").pack(side="right", padx=(20, 5), pady=5)
+        # Заполнение лотка принтера и корзины плоттера — рядом с состоянием; щелчок — «забрал листы»
+        self.laser_tray_lbl = ctk.CTkLabel(toolbar, text="", cursor="hand2")
+        self.laser_tray_lbl.pack(side="right", padx=(0, 6), before=self.laser_status_lbl)
+        self.plotter_tray_lbl = ctk.CTkLabel(toolbar, text="", cursor="hand2")
+        self.plotter_tray_lbl.pack(side="right", padx=(0, 6), before=self.plotter_status_lbl)
+        for role, w in (("laser", self.laser_tray_lbl), ("plotter", self.plotter_tray_lbl)):
+            w.bind("<Button-1>", lambda e, r=role: self._printer_menu(r, e))
+            w.bind("<Button-3>", lambda e, r=role: self._printer_menu(r, e))
+        self.after(200, self._refresh_tray_labels)
         # Main split view
         paned = ctk.CTkFrame(self)
         paned.pack(fill="both", expand=True, padx=10, pady=5)
@@ -812,6 +950,10 @@ class PrintManagerApp(ctk.CTk):
         self.print_progress_frame = ctk.CTkFrame(self.progress_container, fg_color="transparent")
         self.print_progress_frame.grid(row=1, column=0, sticky="ew")
         self.print_progress_frame.columnconfigure(1, weight=1)
+        # Очередь заданий: что стоит в печати и в каком порядке (видна, только когда есть задания)
+        self.tasks_frame = ctk.CTkFrame(self.progress_container, fg_color="transparent")
+        self.tasks_frame.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        self.tasks_frame.grid_remove()
         self.after(1000, self._print_progress_loop)
         
         # Row 2: Buttons
@@ -827,7 +969,9 @@ class PrintManagerApp(ctk.CTk):
         self.btn_trial = ctk.CTkButton(right_btns, text="Пробная печать (Просмотр)", fg_color="#f39c12", hover_color="#e67e22", command=self.show_trial_print)
         self.btn_trial.pack(side="left", padx=5)
         
-        self.btn_print = ctk.CTkButton(right_btns, text="Печать всего плана", fg_color="#2ecc71", hover_color="#27ae60", command=self.print_all)
+        # Главная кнопка — крупная и сразу говорит, сколько и как долго
+        self.btn_print = ctk.CTkButton(right_btns, text="🖨 Печать всего плана", fg_color="#2ecc71", hover_color="#27ae60",
+                                       height=44, font=("Segoe UI", 15, "bold"), command=self.print_all)
         self.btn_print.pack(side="left", padx=5)
 
         # Порядок упаковки важен: Tk отдаёт место тем, кто упакован РАНЬШЕ. Раньше нижняя
@@ -839,6 +983,317 @@ class PrintManagerApp(ctk.CTk):
         bottom_pane.pack(side="bottom", fill="x", padx=10, pady=5)
         paned.pack(fill="both", expand=True, padx=10, pady=5)
         
+    # ───────────── перетаскивание, Проводник, быстрая печать ─────────────
+    def _on_drop(self, paths):
+        """Папку или PDF перетащили в окно."""
+        if not paths:
+            return
+        p = paths[0]
+        if os.path.isdir(p):
+            folder, select = p, None
+        elif p.lower().endswith(".pdf") and os.path.isfile(p):
+            folder, select = os.path.dirname(p), p
+        else:
+            messagebox.showinfo("Перетаскивание", "Перетащите папку с PDF или PDF-файл.", parent=self)
+            return
+        self._select_after_scan = select
+        self.current_folder = folder
+        self.cfg.set("last_folder", folder)
+        self.start_analysis()
+        self._tour_event("folder_opened")
+
+    def _sync_explorer_menu(self):
+        import sys
+        if not getattr(sys, "frozen", False):
+            return       # из исходников меню Проводника не трогаем
+        from core import shell_integration
+        if self.cfg.get("explorer_menu", True):
+            shell_integration.register()
+        else:
+            shell_integration.unregister()
+
+    def _start_quick_from_launch(self):
+        from core.print_request import take_requests
+        paths = [self._print_request] + [p for p in take_requests() if p != self._print_request]
+        self.begin_quick_print(paths, fresh=True)
+
+    def _poll_print_request(self):
+        """Запросы «Напечатать в WPM», пришедшие, когда программа уже была открыта
+        (или следующие файлы при выделении нескольких — Проводник запускает WPM на каждый)."""
+        try:
+            from core.print_request import take_requests
+            paths = take_requests()
+            if paths:
+                self.begin_quick_print(paths, fresh=False)
+        except Exception:
+            logging.error("Запрос печати из Проводника:\n%s", traceback.format_exc())
+        if not getattr(self, "_closing", False):
+            self.after(1000, self._poll_print_request)
+
+    def _file_data(self, fp):
+        """Анализ файла: из открытой папки или из заданий «Напечатать в WPM» (другие папки)."""
+        return self.analyzed_data.get(fp) or self._job_data.get(fp) or {}
+
+    def begin_quick_print(self, paths, fresh=False):
+        """Окно «Напечатать в WPM». Если оно уже открыто — выделенное ДОПИСЫВАЕТСЯ в него
+        (очередь выделенного). Печать из него ставится в конец общей очереди печати."""
+        from core.job_sources import group_sources
+        from ui.components.quick_print import QuickPrintDialog
+        if isinstance(paths, str):
+            paths = [paths]
+        sources, skipped = group_sources([p for p in paths if p and os.path.exists(p)])
+        if not sources:
+            messagebox.showinfo("Напечатать в WPM", "Печатаются только PDF-файлы и папки с PDF.", parent=self)
+            return
+        dlg = self._quick_dialog
+        if dlg is None or not dlg.winfo_exists():
+            dlg = QuickPrintDialog(self, on_print=self._quick_print_go, on_cancel=self._quick_cancel)
+            self._quick_dialog = dlg
+            self._quick_fresh = fresh
+            busy = self.print_tracker.active_count() > 0 or self._print_busy_jobs() > 0
+            if busy:
+                dlg.set_busy_text("Сейчас идёт печать — новое задание встанет в конец очереди.")
+            elif fresh or not self.analyzed_data:
+                try:
+                    self.iconify()      # программа откроется после «Печать»
+                except Exception:
+                    pass
+        added = dlg.add_sources(sources, skipped)
+        for idx in added:
+            self._qp_scan_queue.append((dlg, idx))
+        self._qp_next_scan()
+        dlg.lift()
+        try:
+            dlg.focus_force()
+        except Exception:
+            pass
+
+    def _qp_next_scan(self):
+        """Анализ выделенного — по одному источнику, в фоне, не трогая открытую папку."""
+        if self._qp_scan is not None or not self._qp_scan_queue:
+            return
+        dlg, idx = self._qp_scan_queue.pop(0)
+        try:
+            if not dlg.winfo_exists():
+                return self._qp_next_scan()
+        except Exception:
+            return self._qp_next_scan()
+        src = dlg.sources[idx]
+        folder = src["folder"]
+        token = object()
+        self._qp_scan_token = token
+
+        def on_progress(phase, done, total, fp):
+            if phase in ("analyze", "found"):
+                self.ui_call(lambda: dlg.winfo_exists() and dlg.source_progress(idx, done, total))
+
+        def on_done(results, errors, total):
+            printed = self.history.get_all_printed(folder)
+            self.ui_call(self._qp_scan_done, token, dlg, idx, results, printed, None)
+
+        def on_error(msg):
+            self.ui_call(self._qp_scan_done, token, dlg, idx, {}, {}, msg)
+
+        include_sub = self.cfg.get("include_subfolders", False) if src["files"] is None else False
+        dlg.source_progress(idx, 0, 0)
+        self._qp_scan = ScanJob(folder, include_sub, on_progress, on_done, on_error,
+                                cache=self.analysis_cache).start()
+
+    def _qp_scan_done(self, token, dlg, idx, results, printed, error):
+        if token is not getattr(self, "_qp_scan_token", None):
+            return
+        self._qp_scan = None
+        self._job_data.update(results)
+        try:
+            if dlg.winfo_exists():
+                dlg.source_done(idx, results, printed, error)
+        except Exception:
+            logging.error("Окно быстрой печати:\n%s", traceback.format_exc())
+        self._qp_next_scan()
+
+    def _show_main(self):
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
+    def _quick_cancel(self):
+        self._quick_dialog = None
+        self._qp_scan_queue.clear()
+        if self._qp_scan is not None:
+            self._qp_scan.cancel()
+            self._qp_scan = None
+        busy = self.print_tracker.active_count() > 0 or self._print_busy_jobs() > 0
+        if getattr(self, "_quick_fresh", False) and not busy and not self.tasks:
+            self._on_close()        # программу открыли только ради этой печати
+        else:
+            self._show_main()
+
+    def _quick_print_go(self, formats, copies, reprint, payload):
+        from core.quick_plan import entries_for
+        self._quick_dialog = None
+        data, printed, files = payload["data"], payload["printed"], payload["files"]
+        self._job_data.update(data)
+        entries = entries_for(data, printed, files, copies, formats, reprint=reprint)
+        sheets = sum(len(pgs) * c for _fp, _f, pgs, c in entries)
+        # главное окно: если ничего не открыто/не печатается — показываем первую папку задания
+        busy = self.print_tracker.active_count() > 0 or self._print_busy_jobs() > 0
+        src0 = payload["sources"][0] if payload["sources"] else None
+        if src0 and not busy and (not self.analyzed_data or getattr(self, "_quick_fresh", False)
+                                  or os.path.normcase(src0["folder"]) == os.path.normcase(self.current_folder or "")):
+            self.target_copies.set(str(copies))
+            self.cfg.set("last_copies", str(copies))
+            self.current_folder = src0["folder"]
+            self.cfg.set("last_folder", src0["folder"])
+            self._select_after_scan = (src0["files"] or [None])[0]
+            self.start_analysis()
+        self._show_main()
+        if not entries:
+            return
+        titles = [s["title"] for s in payload["sources"]]
+        title = titles[0] if len(titles) == 1 else f"{titles[0]} и ещё {len(titles) - 1}"
+        fmts = ", ".join(sorted(formats))
+        with self._task(f"{title} · {fmts} · ×{copies}"):
+            for fp, fmt, pgs, c in entries:
+                self._execute_print(fp, fmt, pgs, copies=c)
+        sess = self._quick_session or {"sheets": 0, "started": False}
+        sess["sheets"] += sheets
+        self._quick_session = sess
+        self.status_label.configure(text=f"Задание добавлено в очередь печати: {sheets} л.", text_color="#5dade2")
+
+    def _check_quick_session_done(self):
+        sess = self._quick_session
+        if not sess:
+            return
+        busy = self.print_tracker.active_count() > 0 or self._print_busy_jobs() > 0
+        if busy:
+            sess["started"] = True
+            return
+        if not sess["started"] or (self._quick_dialog is not None and self._quick_dialog.winfo_exists()):
+            return
+        self._quick_session = None          # спрашиваем ОДИН раз — когда допечатано ВСЁ
+        ans = choice_dialog.ask_choice(
+            self, "Печать завершена",
+            f"Печать завершена ({sess['sheets']} л.).\n\nЗакрыть программу?",
+            [("stay", "Оставить программу открытой", "main"), ("close", "Закрыть программу", "alt")],
+            default="stay")
+        if ans == "close":
+            self._on_close()
+
+    # ───────────── очередь заданий (что за чем печатается) ─────────────
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _task(self, title):
+        """Всё, что отправлено на печать внутри блока, — одно задание в «Очереди заданий».
+        Новые задания всегда встают в КОНЕЦ очереди печати каждого принтера."""
+        prev = self._task_ids
+        ids = []
+        self._task_ids = ids
+        try:
+            yield
+        finally:
+            self._task_ids = prev
+            if ids:
+                self.tasks.append({"title": title, "ids": ids, "done_at": None})
+                self._render_tasks()
+
+    def _task_state(self, t):
+        jobs = [self.print_tracker.jobs.get(i) for i in t["ids"]]
+        known = [j for j in jobs if j is not None]
+        if not known:          # трекер уже убрал допечатанные задания
+            return "done", 1.0, 0
+        total = sum(j["slots"] for j in known) or 1
+        if all(j["state"] in ("done", "error") for j in known):
+            return ("error" if any(j["state"] == "error" for j in known) else "done"), 1.0, 0
+        if any(j["state"] in ("sending", "printing") for j in known):
+            done = sum(j["slots"] * (1.0 if j["state"] == "done" else 0.0) for j in known)
+            left = sum(round(j["pages"] * j["copies"]) for j in known if j["state"] not in ("done", "error"))
+            return "printing", done / total, left
+        left = sum(round(j["pages"] * j["copies"]) for j in known if j["state"] not in ("done", "error"))
+        return "queued", 0.0, left
+
+    def _render_tasks(self):
+        frame = getattr(self, "tasks_frame", None)
+        if frame is None:
+            return
+        import time as _t
+        now = _t.monotonic()
+        rows = []
+        for t in self.tasks:
+            st, frac, left = self._task_state(t)
+            if st in ("done", "error") and t["done_at"] is None:
+                t["done_at"] = now
+            rows.append((t, st, frac, left))
+        # готовые показываем ещё минуту, потом убираем
+        self.tasks = [t for t, st, _f, _l in rows if not (st in ("done", "error") and now - t["done_at"] > 60)]
+        rows = [r for r in rows if r[0] in self.tasks]
+        for w in frame.winfo_children():
+            w.destroy()
+        if not rows:
+            frame.grid_remove()
+            return
+        frame.grid()
+        ctk.CTkLabel(frame, text="Очередь заданий:", font=("Segoe UI", 11, "bold"), anchor="w").pack(fill="x")
+        queue_pos = 0
+        for t, st, frac, left in rows[-8:]:
+            if st == "printing":
+                mark, col = f"🖨 печатается · осталось ≈{left} л.", "#5dade2"
+            elif st == "queued":
+                queue_pos += 1
+                mark, col = f"⏳ в очереди ({queue_pos}) · {left} л.", "#f39c12"
+            elif st == "error":
+                mark, col = "✗ ошибка печати", "#e74c3c"
+            else:
+                mark, col = "✓ напечатано", "#2ecc71"
+            ctk.CTkLabel(frame, text=f"{rows.index((t, st, frac, left)) + 1}. {t['title']}  —  {mark}",
+                         anchor="w", text_color=col, font=("Segoe UI", 11)).pack(fill="x")
+
+    # ───────────── печать, прерванная в прошлый раз ─────────────
+    def _inflight_add(self, job, pages, copies, fmt):
+        if not pages or copies <= 0:
+            return
+        lst = list(self.cfg.get("inflight_jobs", []) or [])
+        lst.append({"id": f"{self._session_id}:{getattr(job, 'tracker_id', '')}", "file": job.filepath,
+                    "pages": list(pages), "copies": int(copies), "fmt": fmt,
+                    "printer": getattr(job, "printer_name", "")})
+        self.cfg.set("inflight_jobs", lst)
+
+    def _inflight_done(self, tracker_ids):
+        keys = {f"{self._session_id}:{t}" for t in tracker_ids}
+        lst = list(self.cfg.get("inflight_jobs", []) or [])
+        new = [e for e in lst if e.get("id") not in keys]
+        if len(new) != len(lst):
+            self.cfg.set("inflight_jobs", new)
+
+    def _ask_stale_inflight(self):
+        items = self._stale_inflight
+        self._stale_inflight = []
+        if not items:
+            return
+        lines = [f"• {os.path.basename(e['file'])} — {e.get('fmt', '')}, {len(e['pages'])} стр. × {e['copies']}"
+                 for e in items[:8]]
+        if len(items) > 8:
+            lines.append(f"… и ещё {len(items) - 8}")
+        ans = choice_dialog.ask_choice(
+            self, "Печать была прервана",
+            "В прошлый раз программа закрылась, когда принтер ещё печатал. Эти листы отмечены "
+            "напечатанными, но могли не выйти:\n\n" + "\n".join(lines) + "\n\nОни напечатались?",
+            [("ok", "Да, всё вышло", "main"),
+             ("undo", "Нет — снять отметки, чтобы допечатать", "danger"),
+             (None, "Не знаю — оставить как есть", "cancel")], default="ok")
+        if ans == "undo":
+            for e in items:
+                self.history.unprint_pages(e["file"], e["pages"], e["copies"], e.get("fmt", ""))
+            for fp in {e["file"] for e in items}:
+                if fp in self.analyzed_data:
+                    self._reload_file_history(fp)
+            self._update_plan_and_ui()
+            self.status_label.configure(text="Отметки прерванной печати сняты — их можно допечатать",
+                                        text_color="#f39c12")
+
     def open_folder(self):
         # Выбор папки доступен и ВО ВРЕМЯ анализа: старый анализ отменяется.
         folder = filedialog.askdirectory(initialdir=self.current_folder or None, parent=self)
@@ -969,6 +1424,21 @@ class PrintManagerApp(ctk.CTk):
             logging.warning("Не удалось проанализировать: %s", errors)
         self.status_label.configure(text=text, text_color="#f39c12")
         self._update_plan_and_ui()
+        sel = self._select_after_scan
+        self._select_after_scan = None
+        if sel and sel in self.analyzed_data:
+            self.select_file(sel)
+
+    def select_file(self, fp):
+        """Выделить файл в списке и показать его страницы (печать файла из Проводника)."""
+        try:
+            item = self.file_tree._items.get(fp)
+            if item:
+                self.file_tree.tree.selection_set(item)
+                self.file_tree.tree.see(item)
+        except Exception:
+            pass
+        self.on_file_selected(fp)
 
     def _update_plan_and_ui(self):
         try: tc = self.target_copies.get()
@@ -1015,6 +1485,11 @@ class PrintManagerApp(ctk.CTk):
                      f"   (HP {fmt_duration(est['laser'])} | плоттер {fmt_duration(est['plotter'])}, параллельно)")
         else:
             self.estimate_label.configure(text="⏱ Всё напечатано" if self.analyzed_data else "")
+        total_left = self.current_plan["stats"].get("grand_total", 0)
+        if total_left:
+            self.btn_print.configure(text=f"🖨 Напечатать {total_left} л.  (≈{fmt_duration(est['wall'])})")
+        else:
+            self.btn_print.configure(text="✓ Всё напечатано" if self.analyzed_data else "🖨 Печать всего плана")
         
         # Refresh current selection
         if hasattr(self, 'current_selected_file') and self.current_selected_file:
@@ -1252,27 +1727,31 @@ class PrintManagerApp(ctk.CTk):
 
         if already > 0:
             if missing_sheets == 0:
-                if not messagebox.askyesno("Печать группы", f"Формат {fmt} уже напечатан полностью ({tc} коп.).\n\n"
-                                           "Напечатать всю группу ещё раз?", parent=self):
+                if choice_dialog.ask_choice(self, "Печать группы",
+                                            f"Формат {fmt} уже напечатан полностью ({tc} коп.).",
+                                            [("all", f"Напечатать формат {fmt} ещё раз", "danger"),
+                                             (None, "Отмена", "cancel")]) != "all":
                     return
             else:
-                ans = messagebox.askyesnocancel(
-                    "Печать группы",
-                    f"Формат {fmt}: уже напечатано {already} из {total_sheets} листов.\n\n"
-                    f"ДА — допечатать только недостающее ({missing_sheets} л.)\n"
-                    f"НЕТ — напечатать всю группу заново\n"
-                    f"Отмена — ничего не печатать", parent=self)
+                ans = choice_dialog.ask_choice(
+                    self, "Печать группы",
+                    f"Формат {fmt}: уже напечатано {already} из {total_sheets} листов.",
+                    [("missing", f"Допечатать недостающее ({missing_sheets} л.)", "main"),
+                     ("all", f"Напечатать весь формат заново ({total_sheets} л.)", "danger"),
+                     (None, "Отмена", "cancel")], default="missing")
                 if ans is None:
                     return
-                if ans:
-                    for m, pgs in sorted(missing_by_count.items()):
-                        self._execute_print(filepath, fmt, pgs, copies=m)
+                if ans == "missing":
+                    with self._task(f"📄 {os.path.basename(filepath)} · {fmt} · недостающее"):
+                        for m, pgs in sorted(missing_by_count.items()):
+                            self._execute_print(filepath, fmt, pgs, copies=m)
                     return
         val = sd.askinteger("Печать группы", f"Количество копий для формата {fmt}:", initialvalue=tc, minvalue=1,
                             parent=self)
         if val is None:
             return
-        self._execute_print(filepath, fmt, pages_list, copies=val)
+        with self._task(f"📄 {os.path.basename(filepath)} · {fmt} · ×{val}"):
+            self._execute_print(filepath, fmt, pages_list, copies=val)
         
     def mark_format_group(self, filepath, fmt, pages_list, state):
         try: tc = self.target_copies.get()
@@ -1298,13 +1777,17 @@ class PrintManagerApp(ctk.CTk):
             val = sd.askinteger("Печать страницы", f"Количество копий для страницы {pn}:", initialvalue=tc, minvalue=1)
             if val is None:
                 return
-            self._execute_print(filepath, fmt, [pn], copies=val)
+            with self._task(f"📄 {os.path.basename(filepath)} · стр. {pn} · ×{val}"):
+                self._execute_print(filepath, fmt, [pn], copies=val)
             
     def _on_printer_alert(self, printer_name, error_msg):
         """Сигнал из очереди печати во время задания (может прийти из любого потока)."""
         def show():
             from core.printer_status import problems_from_text, PROBLEMS
-            keys = problems_from_text(error_msg) or {"error"}
+            keys = problems_from_text(error_msg)
+            if not keys or keys == {"error"}:
+                logging.info("Принтер %s: %s (без уведомления — общий флаг ошибки)", printer_name, error_msg)
+                return
             key = next(iter(keys))
             self.status_label.configure(text=f"⚠ Принтер «{printer_name}»: {error_msg}", text_color="#e74c3c")
             n = getattr(self, "notifier", None)
@@ -1370,7 +1853,7 @@ class PrintManagerApp(ctk.CTk):
             settings = self.cfg.get("printers", {}).get("plotter", {}).get("settings", "")
             # место в корзине — по площади листа в листах A2 (берём самый большой лист задания)
             want = set(pages_list)
-            sizes = [(p[2], p[3]) for p in self.analyzed_data.get(filepath, {}).get("pages", []) if p[0] in want]
+            sizes = [(p[2], p[3]) for p in self._file_data(filepath).get("pages", []) if p[0] in want]
             slot = max([plotter_slots(fmt, w, h) for w, h in sizes] or [plotter_slots(fmt)])
 
         # Лоток выдачи: общий счётчик для всех заданий принтера (см. core/output_tray.py)
@@ -1382,7 +1865,7 @@ class PrintManagerApp(ctk.CTk):
                 _, a, b, k = st
                 self.total_print_jobs += 1
                 self._queue_job(filepath, printer_name, engine, settings, k, pages_list[a:b], fmt,
-                                global_scale, rasterize_dpi)
+                                global_scale, rasterize_dpi, slot=slot)
             else:
                 self.queue_manager.add_pause(
                     printer_name,
@@ -1419,7 +1902,7 @@ class PrintManagerApp(ctk.CTk):
         # Корзину плоттера (≈8 свёрнутых A2) задают уже «по опыту» — без дополнительного запаса
         return effective_capacity(cap, pct if kind == "laser" else 100)
 
-    def _queue_job(self, filepath, printer_name, engine, settings, copies, pages, fmt, scale, dpi):
+    def _queue_job(self, filepath, printer_name, engine, settings, copies, pages, fmt, scale, dpi, slot=1):
         """Ставит задание в очередь печати и регистрирует его в трекере прогресса."""
         from core.pdf_utils import is_laser
         kind = "laser" if is_laser(fmt) else "plotter"
@@ -1432,10 +1915,13 @@ class PrintManagerApp(ctk.CTk):
                 from core.pdf_utils import is_heavy_page, heavy_threshold
                 want = set(pages or [])
                 thr = heavy_threshold()
-                job.heavy = any(is_heavy_page(p, thr) for p in self.analyzed_data.get(filepath, {}).get("pages", [])
+                job.heavy = any(is_heavy_page(p, thr) for p in self._file_data(filepath).get("pages", [])
                                 if not want or p[0] in want)
             job.tracker_id = self.print_tracker.add(filepath, fmt, len(pages or []), copies,
-                                                    printer_name, kind, est, page_list=pages)
+                                                    printer_name, kind, est, page_list=pages,
+                                                    slots=len(pages or []) * copies * slot)
+            if self._task_ids is not None:
+                self._task_ids.append(job.tracker_id)
         self._had_print_activity = True
         return job
 
@@ -1445,7 +1931,7 @@ class PrintManagerApp(ctk.CTk):
         model = prof[kind][detect_model(kind, printer_name)]
         if kind == "laser":
             return laser_job_seconds(len(pages or []), fmt, copies, model, over)
-        data = self.analyzed_data.get(filepath, {})
+        data = self._file_data(filepath)
         sizes_by_page = {p[0]: (p[2], p[3]) for p in data.get("pages", [])}
         sizes = [sizes_by_page.get(p, (594.0, 841.0)) for p in (pages or [])]
         return plotter_job_seconds(sizes, copies, model, over)
@@ -1455,6 +1941,19 @@ class PrintManagerApp(ctk.CTk):
         try:
             finished_files = self.print_tracker.tick()
             changed = self.print_tracker.pop_changed()   # допечатался формат/задание — обновить отметки
+            done_jobs = self.print_tracker.pop_done()
+            for j in done_jobs:                          # листы легли в лоток
+                self.trays.delivered(j["printer"], j["slots"])
+            if done_jobs:
+                self._inflight_done([j["id"] for j in done_jobs])
+            self._check_quick_session_done()
+            if self.tasks:
+                self._render_tasks()
+            for p in list(self.trays.fill):
+                q = self.queue_manager.queues.get(p)
+                if not self.print_tracker.printing_now(p) and not (q and q.unfinished_tasks) \
+                        and not any(j["printer"] == p and j["state"] == "queued" for j in list(self.print_tracker.jobs.values())):
+                    self.trays.sync_idle(p)
             if finished_files or changed:
                 import datetime
                 now = datetime.datetime.now()
@@ -1531,7 +2030,9 @@ class PrintManagerApp(ctk.CTk):
             if not ans:
                 pause_job.cancelled = True
                 if getattr(pause_job, "printer_name", ""):
-                    self.trays.emptied(pause_job.printer_name)   # человек у принтера — лоток пуст
+                    self.trays.reset(pause_job.printer_name)   # очередь снята, человек у принтера — лоток пуст
+            elif getattr(pause_job, "printer_name", ""):
+                self.trays.pause_ok(pause_job.printer_name)    # ОК — листы забрали
             pause_job.event.set()
         self.ui_call(show_msg)
         
@@ -1582,6 +2083,60 @@ class PrintManagerApp(ctk.CTk):
         open_dialog(self, "_settings_dlg", lambda: SettingsDialog(self))
         
     # ───────────── справка и обучение ─────────────
+    def _help_menu(self, event=None):
+        import tkinter as tk
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Справка и вопросы  (F1)", command=self.open_help)
+        m.add_separator()
+        m.add_command(label="🎓 Быстрое обучение (8 шагов)", command=lambda: self.start_tour(mode="quick"))
+        m.add_command(label="🎓 Подробное обучение", command=lambda: self.start_tour(mode="full"))
+        m.add_command(label="Горячие клавиши", command=self._show_hotkeys)
+        m.add_separator()
+        m.add_command(label="Проверить обновления", command=lambda: self.check_updates(manual=True))
+        m.add_command(label="Сообщить об ошибке…", command=self._open_bug_report)
+        b = self.btn_help
+        m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+
+    HOTKEYS = [("Ctrl+O", "открыть папку"), ("Ctrl+P", "напечатать весь план"),
+               ("Ctrl+T", "пробная печать (просмотр)"), ("Ctrl+R", "отчёт"),
+               ("F1", "справка"), ("F5", "проанализировать папку заново")]
+
+    def _print_all_confirm(self):
+        """Ctrl+P — с подтверждением: случайное нажатие не отправит весь комплект."""
+        if not self.current_plan:
+            return
+        n = self.current_plan["stats"].get("grand_total", 0)
+        if not n:
+            messagebox.showinfo("Печать", "Всё уже напечатано.", parent=self)
+            return
+        if choice_dialog.ask_choice(self, "Печать", f"Напечатать весь план — {n} л.?",
+                                    [("go", f"🖨 Напечатать {n} л.", "main"), (None, "Отмена", "cancel")],
+                                    default="go") == "go":
+            self.print_all()
+
+    def _show_hotkeys(self):
+        messagebox.showinfo("Горячие клавиши", "\n".join(f"{k} — {v}" for k, v in self.HOTKEYS) +
+                            "\n\nПапку можно просто перетащить в окно программы, а в Проводнике — "
+                            "правый клик по папке или PDF → «Напечатать в WPM».", parent=self)
+
+    def _bind_hotkeys(self):
+        def guard(fn):
+            def h(e=None):
+                try:
+                    if self.grab_current() is None:
+                        fn()
+                except Exception:
+                    logging.error("Горячая клавиша:\n%s", traceback.format_exc())
+                return "break"
+            return h
+        for seq, fn in (("<Control-o>", self.open_folder), ("<Control-O>", self.open_folder),
+                        ("<Control-p>", self._print_all_confirm), ("<Control-P>", self._print_all_confirm),
+                        ("<Control-t>", self.show_trial_print), ("<Control-T>", self.show_trial_print),
+                        ("<Control-r>", self.show_report), ("<Control-R>", self.show_report),
+                        ("<F1>", self.open_help),
+                        ("<F5>", lambda: self.current_folder and self.start_analysis())):
+            self.bind_all(seq, guard(fn))
+
     def open_help(self, topic=None):
         from ui.components.help_window import HelpWindow
         dlg = open_dialog(self, "_help_dlg", lambda: HelpWindow(self, open_topic=topic))
@@ -1593,8 +2148,8 @@ class PrintManagerApp(ctk.CTk):
         self._tour_event("help_opened")
         return dlg
 
-    def start_tour(self, offer=False):
-        from ui.components.tour import Tour
+    def start_tour(self, offer=False, mode="quick"):
+        from ui.components.tour import Tour, STEPS, QUICK_STEPS
         from ui.components.tour import TOUR_VERSION
         self.cfg.set("tour_seen_version", TOUR_VERSION)   # предлагаем один раз (до следующей версии обучения)
         old = getattr(self, "_tour", None)
@@ -1602,7 +2157,7 @@ class PrintManagerApp(ctk.CTk):
             old.close()
         self._sim_sheets = 0
         try:
-            self._tour = Tour(self, offer=offer)
+            self._tour = Tour(self, steps=QUICK_STEPS if mode == "quick" else STEPS, offer=offer)
         except Exception:
             logging.error("Не удалось запустить обучение:\n%s", traceback.format_exc())
             self._tour = None
@@ -1651,26 +2206,29 @@ class PrintManagerApp(ctk.CTk):
 
         if already > 0:
             if missing_sheets == 0:
-                if not messagebox.askyesno("Печать файла", f"«{name}» уже напечатан полностью ({tc} коп.).\n\n"
-                                           "Напечатать его ещё раз целиком?", parent=self):
+                if choice_dialog.ask_choice(self, "Печать файла",
+                                            f"«{name}» уже напечатан полностью ({tc} коп.).",
+                                            [("all", "Напечатать файл ещё раз целиком", "danger"),
+                                             (None, "Отмена", "cancel")]) != "all":
                     return
                 mode = "all"
             else:
-                ans = messagebox.askyesnocancel(
-                    "Печать файла",
-                    f"«{name}»: уже напечатано {already} из {total_sheets} листов.\n\n"
-                    f"ДА — допечатать только недостающее ({missing_sheets} л.)\n"
-                    f"НЕТ — напечатать весь файл заново\n"
-                    f"Отмена — ничего не печатать", parent=self)
+                ans = choice_dialog.ask_choice(
+                    self, "Печать файла",
+                    f"«{name}»: уже напечатано {already} из {total_sheets} листов.",
+                    [("missing", f"Допечатать недостающее ({missing_sheets} л.)", "main"),
+                     ("all", f"Напечатать весь файл заново ({total_sheets} л.)", "danger"),
+                     (None, "Отмена", "cancel")], default="missing")
                 if ans is None:
                     return
-                mode = "missing" if ans else "all"
+                mode = ans
         else:
             mode = "all"
 
         if mode == "missing":
-            for fmt, pgs, m in missing:
-                self._execute_print(filepath, fmt, pgs, copies=m)
+            with self._task(f"📄 {name} · недостающее"):
+                for fmt, pgs, m in missing:
+                    self._execute_print(filepath, fmt, pgs, copies=m)
             self._print_done_info(f"«{name}»: в очередь добавлено недостающее — {missing_sheets} л.")
             return
 
@@ -1681,8 +2239,9 @@ class PrintManagerApp(ctk.CTk):
         fmt_groups = {}
         for info in data["pages"]:
             fmt_groups.setdefault(info[1], []).append(info[0])
-        for fmt, pages in fmt_groups.items():
-            self._execute_print(filepath, fmt, pages, copies=copies)
+        with self._task(f"📄 {name} · весь файл · ×{copies}"):
+            for fmt, pages in fmt_groups.items():
+                self._execute_print(filepath, fmt, pages, copies=copies)
         self._print_done_info(f"Задания для «{name}» добавлены в очередь.")
 
     def preview_single_file(self, filepath):
@@ -1717,18 +2276,19 @@ class PrintManagerApp(ctk.CTk):
             return
             
         self.queue_manager.start()
-        
-        for fp, fn, pgs, inf in self.current_plan["laser"]:
-            if inf["missing"] > 0:
-                self._execute_print(fp, inf["format"], pgs, copies=inf["missing"])
-                self.update() # Yield to UI to prevent freezing
+        name = os.path.basename((self.current_folder or "").rstrip("\\/")) or "план"
+        with self._task(f"📁 {name} · весь план"):
+            for fp, fn, pgs, inf in self.current_plan["laser"]:
+                if inf["missing"] > 0:
+                    self._execute_print(fp, inf["format"], pgs, copies=inf["missing"])
+                    self.update() # Yield to UI to prevent freezing
+
+            for fp, fn, pgs, inf in self.current_plan["plotter"]:
+                if inf["missing"] > 0:
+                    self._execute_print(fp, inf["format"], pgs, copies=inf["missing"])
+                    self.update() # Yield to UI to prevent freezing
                 
-        for fp, fn, pgs, inf in self.current_plan["plotter"]:
-            if inf["missing"] > 0:
-                self._execute_print(fp, inf["format"], pgs, copies=inf["missing"])
-                self.update() # Yield to UI to prevent freezing
-                
-        self._print_done_info("Все задания добавлены в очередь.")
+        self._print_done_info("Все задания добавлены в конец очереди печати.")
             
     def on_print_start(self, job):
         import datetime
@@ -1764,7 +2324,7 @@ class PrintManagerApp(ctk.CTk):
         
         pages_to_add = job.pages
         if not pages_to_add:
-            data = self.analyzed_data.get(job.filepath)
+            data = self._file_data(job.filepath)
             if data:
                 pages_to_add = [i[0] for i in data["pages"]]
                 
@@ -1782,9 +2342,11 @@ class PrintManagerApp(ctk.CTk):
                 
             if completed_copies > 0:
                 self.history.add_printed(job.filepath, pages_to_add, completed_copies, fmt)
+                self._inflight_add(job, pages_to_add, completed_copies, fmt)
             
             if remainder > 0:
                 self.history.add_printed(job.filepath, pages_to_add[:remainder], 1, fmt)
+                self._inflight_add(job, pages_to_add[:remainder], 1, fmt)
         
         self._reload_file_history(job.filepath)
         

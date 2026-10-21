@@ -22,15 +22,17 @@ class PrintTracker:
         self.jobs = {}          # id -> dict
         self.changed = False    # было ли изменение состояния заданий с прошлого tick()
         self._stopped = {}      # принтер -> когда остановился (нет бумаги, замятие…)
+        self._done = []         # задания, допечатанные с прошлого pop_done()
 
     # ───────────── события ─────────────
-    def add(self, filepath, fmt, pages, copies, printer, kind, est_seconds, page_list=None):
+    def add(self, filepath, fmt, pages, copies, printer, kind, est_seconds, page_list=None, slots=None):
         jid = next(self._ids)
         self.jobs[jid] = {
             "id": jid, "file": filepath, "fmt": fmt, "pages": int(pages), "copies": int(copies),
             "printer": printer, "kind": kind, "est": max(float(est_seconds), 5.0),
             "state": "queued", "started": None, "spooled": None, "finished": None,
             "printed": 0, "total": 0, "page_list": list(page_list or []),
+            "slots": float(slots) if slots is not None else float(int(pages) * int(copies)),
         }
         return jid
 
@@ -90,6 +92,7 @@ class PrintTracker:
                 j["state"], j["finished"] = "done", now
                 touched.add(j["file"])
                 self.changed = True
+                self._done.append(dict(j))
         return [f for f in touched if self.active_count(f) == 0]
 
     def clear_finished(self, printer=None, older_than=10.0):
@@ -153,6 +156,10 @@ class PrintTracker:
             if j["file"] == filepath and j["state"] in ("queued", "sending", "printing"):
                 out.update(j["page_list"])
         return out
+
+    def pop_done(self):
+        done, self._done = self._done, []
+        return done
 
     def pop_changed(self):
         ch, self.changed = self.changed, False

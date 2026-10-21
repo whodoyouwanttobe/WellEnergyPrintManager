@@ -1,4 +1,5 @@
 """Справка (docs/help.md), повторная печать файла, условные запросы обновлений."""
+import contextlib
 import io
 import json
 import os
@@ -78,8 +79,12 @@ def _fake_app(printed):
         target_copies=_Copies(1),
         _execute_print=lambda f, fmt, pgs, copies=1: calls.append((fmt, list(pgs), copies)),
         _print_done_info=lambda text: None,
+        _task=lambda title: contextlib.nullcontext(),
     )
     return app, fp, calls
+
+
+from ui.components import choice_dialog
 
 
 @pytest.fixture
@@ -96,9 +101,9 @@ def test_single_file_partial_prints_only_missing(quiet):
     from ui.app import PrintManagerApp
     app, fp, calls = _fake_app({1: {"printed": 1}, 2: {"printed": 1}})   # A4 готов, A1 нет
     asked = []
-    mp.setattr(mb, "askyesnocancel", lambda *a, **k: asked.append(a) or True)   # «Да» — только недостающее
+    mp.setattr(choice_dialog, "ask_choice", lambda *a, **k: asked.append(a) or "missing")   # только недостающее
     PrintManagerApp.print_single_file(app, fp)
-    assert asked and "2 из 3" in asked[0][1]
+    assert asked and "2 из 3" in asked[0][2]
     assert calls == [("A1", [3], 1)]
 
 
@@ -107,7 +112,7 @@ def test_single_file_partial_no_reprints_all(quiet):
     import tkinter.simpledialog as sd
     from ui.app import PrintManagerApp
     app, fp, calls = _fake_app({1: {"printed": 1}})
-    mp.setattr(mb, "askyesnocancel", lambda *a, **k: False)     # «Нет» — весь файл
+    mp.setattr(choice_dialog, "ask_choice", lambda *a, **k: "all")     # «Нет» — весь файл
     mp.setattr(sd, "askinteger", lambda *a, **k: 1)
     PrintManagerApp.print_single_file(app, fp)
     assert sorted(calls) == [("A1", [3], 1), ("A4", [1, 2], 1)]
@@ -117,7 +122,7 @@ def test_single_file_partial_cancel_prints_nothing(quiet):
     mp, mb, _ = quiet
     from ui.app import PrintManagerApp
     app, fp, calls = _fake_app({1: {"printed": 1}})
-    mp.setattr(mb, "askyesnocancel", lambda *a, **k: None)
+    mp.setattr(choice_dialog, "ask_choice", lambda *a, **k: None)
     PrintManagerApp.print_single_file(app, fp)
     assert calls == []
 
@@ -126,7 +131,7 @@ def test_single_file_fully_printed_asks_before_reprint(quiet):
     mp, mb, _ = quiet
     from ui.app import PrintManagerApp
     app, fp, calls = _fake_app({1: {"printed": 1}, 2: {"printed": 1}, 3: {"printed": 1}})
-    mp.setattr(mb, "askyesno", lambda *a, **k: False)
+    mp.setattr(choice_dialog, "ask_choice", lambda *a, **k: None)
     PrintManagerApp.print_single_file(app, fp)
     assert calls == []
 
@@ -167,7 +172,8 @@ def test_fetch_releases_uses_etag_and_304(monkeypatch):
 def _group_app(printed, tc=1):
     calls = []
     app = types.SimpleNamespace(printed_pages={"C:/p/doc.pdf": printed}, target_copies=_Copies(tc),
-                                _execute_print=lambda f, fmt, pgs, copies=1: calls.append((fmt, list(pgs), copies)))
+                                _execute_print=lambda f, fmt, pgs, copies=1: calls.append((fmt, list(pgs), copies)),
+                                _task=lambda title: contextlib.nullcontext())
     return app, calls
 
 
@@ -176,7 +182,7 @@ def test_group_partial_yes_prints_only_missing(quiet):
     from ui.app import PrintManagerApp
     app, calls = _group_app({1: {"printed": 2}, 2: {"printed": 1}}, tc=2)
     asked = []
-    mp.setattr(mb, "askyesnocancel", lambda *a, **k: asked.append(a[1]) or True)
+    mp.setattr(choice_dialog, "ask_choice", lambda *a, **k: asked.append(a[2]) or "missing")
     PrintManagerApp.print_format_group(app, "C:/p/doc.pdf", "A4", [1, 2, 3])
     assert "3 из 6" in asked[0]
     assert sorted(calls) == [("A4", [2], 1), ("A4", [3], 2)]     # стр.1 уже 2/2 — не печатается
@@ -187,7 +193,7 @@ def test_group_partial_no_prints_all(quiet):
     import tkinter.simpledialog as sd
     from ui.app import PrintManagerApp
     app, calls = _group_app({1: {"printed": 1}})
-    mp.setattr(mb, "askyesnocancel", lambda *a, **k: False)
+    mp.setattr(choice_dialog, "ask_choice", lambda *a, **k: "all")
     mp.setattr(sd, "askinteger", lambda *a, **k: 1)
     PrintManagerApp.print_format_group(app, "C:/p/doc.pdf", "A4", [1, 2, 3])
     assert calls == [("A4", [1, 2, 3], 1)]
@@ -197,9 +203,9 @@ def test_group_cancel_and_fully_printed(quiet):
     mp, mb, _ = quiet
     from ui.app import PrintManagerApp
     app, calls = _group_app({1: {"printed": 1}})
-    mp.setattr(mb, "askyesnocancel", lambda *a, **k: None)
+    mp.setattr(choice_dialog, "ask_choice", lambda *a, **k: None)
     PrintManagerApp.print_format_group(app, "C:/p/doc.pdf", "A4", [1, 2])
     app2, calls2 = _group_app({1: {"printed": 1}, 2: {"printed": 1}})
-    mp.setattr(mb, "askyesno", lambda *a, **k: False)
+    mp.setattr(choice_dialog, "ask_choice", lambda *a, **k: None)
     PrintManagerApp.print_format_group(app2, "C:/p/doc.pdf", "A4", [1, 2])
     assert calls == [] and calls2 == []
