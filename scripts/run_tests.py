@@ -24,9 +24,31 @@ for _stream in (sys.stdout, sys.stderr):
 ENV = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
 
 
+ON_CI = bool(os.environ.get("GITHUB_ACTIONS"))
+
+
+def _annotate(output):
+    """На GitHub — понятные аннотации с именем теста и причиной (их видно без входа в аккаунт)."""
+    if not ON_CI:
+        return
+    lines = output.splitlines()
+    failed = [ln.split(" ", 1)[1].split(" - ")[0] for ln in lines if ln.startswith(("FAILED ", "ERROR "))]
+    errors = [ln for ln in lines if ln.startswith("E ")]
+    reason = " | ".join(e[1:].strip() for e in errors[:4])[:900] or "см. лог шага"
+    for f in failed or ["(тест)"]:
+        msg = f"{f}: {reason}".replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+        print(f"::error title=Тест не прошёл::{msg}", flush=True)
+
+
 def run(args):
     print(">>> pytest " + " ".join(args), flush=True)
-    return subprocess.call([sys.executable, "-m", "pytest", *args], cwd=ROOT, env=ENV)
+    proc = subprocess.run([sys.executable, "-m", "pytest", "-rfE", *args], cwd=ROOT, env=ENV,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                          encoding="utf-8", errors="replace")
+    print(proc.stdout, flush=True)
+    if proc.returncode != 0:
+        _annotate(proc.stdout)
+    return proc.returncode
 
 
 def main():
