@@ -93,10 +93,17 @@ jobs:
           $hung = -not $p.WaitForExit(180000)
           if ($hung) { $p.Kill() }
           # Отчёт и журнал печатаем ВСЕГДА — чтобы по логу было видно, что именно не так
-          if (Test-Path selftest.txt) { Get-Content selftest.txt -Encoding UTF8 } else { Write-Host "selftest.txt не создан — exe упал до конца самопроверки" }
+          if (Test-Path selftest.txt) {
+            Get-Content selftest.txt -Encoding UTF8
+            # каждая непройденная проверка — отдельной аннотацией (их видно без входа в GitHub)
+            Get-Content selftest.txt -Encoding UTF8 | Where-Object { $_ -like "[[]FAIL]*" } | ForEach-Object {
+              $m = ($_ -replace "%", "%25"); Write-Host "::error title=Самопроверка::$m" }
+          } else { Write-Host "::error::selftest.txt не создан — exe упал до конца самопроверки" }
           Get-ChildItem $env:TEMP -Directory -Filter "wpm_selftest_*" -ErrorAction SilentlyContinue | ForEach-Object {
             Get-ChildItem $_.FullName -Recurse -Include print_manager.log, crash_native.log -ErrorAction SilentlyContinue | ForEach-Object {
-              Write-Host "===== $($_.FullName) ====="; Get-Content $_.FullName -Encoding UTF8 -Tail 120 } }
+              Write-Host "===== $($_.FullName) ====="; Get-Content $_.FullName -Encoding UTF8 -Tail 120
+              Get-Content $_.FullName -Encoding UTF8 | Where-Object { $_ -match "ERROR|CRITICAL|Traceback|Error:" } |
+                Select-Object -Last 6 | ForEach-Object { $m = ($_ -replace "%", "%25"); Write-Host "::warning title=Журнал exe::$m" } } }
           if ($hung) { Write-Host "::error::exe завис в самопроверке"; exit 1 }
           if ($p.ExitCode -ne 0) { Write-Host "::error::Самопроверка exe не пройдена (код $($p.ExitCode)) — подробности в логе шага"; exit 1 }
 
