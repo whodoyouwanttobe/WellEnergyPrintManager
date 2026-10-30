@@ -85,7 +85,10 @@ def run_self_test(work_dir):
         make_sample_pdfs(folder_a)
         make_sample_pdfs(folder_b, many=40)
     except Exception as e:
-        res.check(False, "создание тестовых PDF", repr(e))
+        # с местом ошибки (файл:строка) — чтобы по отчёту сборки было видно, чего не хватает
+        tb = traceback.extract_tb(e.__traceback__)
+        where = " <- ".join(f"{os.path.basename(f.filename)}:{f.lineno}" for f in tb[-3:])
+        res.check(False, "создание тестовых PDF", f"{e!r} @ {where}; filename={getattr(e, 'filename', None)}")
         return res.ok, res.text()
 
     from core.config import get_config

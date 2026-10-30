@@ -25,6 +25,9 @@ if __name__ == '__main__':
         '--add-data=docs;docs',            # справка «?»
         '--hidden-import=win32timezone',
         '--collect-data=customtkinter',
+        # PyMuPDF: шрифты и служебные файлы. Без них новые версии PyMuPDF в собранном exe
+        # падают с FileNotFoundError при создании/записи PDF (самопроверка, растеризация).
+        '--collect-all=pymupdf',
     ]
     # Только нужные инструменты, без кэша SumatraPDF
     for tool in ("SumatraPDF.exe", "PDFtoPrinter.exe", "SumatraPDF-settings.txt"):
