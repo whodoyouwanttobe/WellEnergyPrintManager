@@ -85,3 +85,11 @@ def test_incompatible_formats_not_selected():
     assert not s["610x900"]["standard"] and s["610x900"]["fits"]
     e = entries_for(analyzed, {}, ["C:/p/x.pdf"], 1, ["A1", "980x1200", "610x900"])
     assert {f for _fp, f, _p, _c in e} == {"A1", "610x900"}   # не помещающийся не отправляется
+
+
+def test_print_args_from_sendto():
+    """«Отправить → WPM — напечатать» передаёт все выделенные пути после --print."""
+    from core.shell_integration import parse_print_args
+    assert parse_print_args(["--print", r"C:\a.pdf", r"C:\b.pdf", r"C:\Папка"]) == [r"C:\a.pdf", r"C:\b.pdf", r"C:\Папка"]
+    assert parse_print_args(["--print=C:\\x.pdf"]) == ["C:\\x.pdf"]
+    assert parse_print_args(["--self-test"]) == []

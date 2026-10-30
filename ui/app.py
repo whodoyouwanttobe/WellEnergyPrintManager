@@ -180,13 +180,18 @@ class PrintManagerApp(ctk.CTk):
             self.focus_force()
         except Exception:
             pass
-        # Перетаскивание папки/PDF в окно и пункт в меню Проводника (только Windows)
-        try:
-            from ui.dnd_win import enable_drop
-            enable_drop(self, self._on_drop)
-        except Exception:
-            logging.exception("Перетаскивание")
-        self._sync_explorer_menu()
+        # Перетаскивание папки/PDF в окно и пункт в меню Проводника (только Windows).
+        # В самопроверке (сборка на GitHub) систему не трогаем.
+        if not os.environ.get("WPM_SELFTEST"):
+            try:
+                from ui.dnd_win import enable_drop
+                enable_drop(self, self._on_drop)
+            except Exception:
+                logging.exception("Перетаскивание")
+            try:
+                self._sync_explorer_menu()
+            except Exception:
+                logging.exception("Меню Проводника")
         # Первый запуск — предложить обучение (один раз). При печати из Проводника — не мешаем.
         from ui.components.tour import TOUR_VERSION
         if int(self.cfg.get("tour_seen_version", 0) or 0) < TOUR_VERSION and not os.environ.get("WPM_NO_TOUR") \
@@ -1014,7 +1019,8 @@ class PrintManagerApp(ctk.CTk):
 
     def _start_quick_from_launch(self):
         from core.print_request import take_requests
-        paths = [self._print_request] + [p for p in take_requests() if p != self._print_request]
+        first = self._print_request if isinstance(self._print_request, list) else [self._print_request]
+        paths = list(first) + [p for p in take_requests() if p not in first]
         self.begin_quick_print(paths, fresh=True)
 
     def _poll_print_request(self):

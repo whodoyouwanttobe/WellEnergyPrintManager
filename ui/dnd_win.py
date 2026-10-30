@@ -10,7 +10,9 @@ import sys
 log = logging.getLogger(__name__)
 
 WM_DROPFILES = 0x0233
+WM_NCDESTROY = 0x0082
 GWLP_WNDPROC = -4
+_KEEP = []        # оконные процедуры живут до конца процесса (иначе падение при закрытии окна)
 
 
 def enable_drop(widget, callback):
@@ -47,6 +49,13 @@ def enable_drop(widget, callback):
         old_proc = get_long(hwnd, GWLP_WNDPROC)
 
         def proc(h, msg, wp, lp):
+            if msg == WM_NCDESTROY:
+                # окно уничтожается — возвращаем родную процедуру Tk
+                try:
+                    set_long(h, GWLP_WNDPROC, old_proc)
+                except Exception:
+                    pass
+                return user32.CallWindowProcW(old_proc, h, msg, wp, lp)
             if msg == WM_DROPFILES:
                 try:
                     hdrop = ctypes.c_void_p(wp)
@@ -64,8 +73,10 @@ def enable_drop(widget, callback):
                 return 0
             return user32.CallWindowProcW(old_proc, h, msg, wp, lp)
 
-        widget._wpm_drop_proc = WNDPROC(proc)      # держим ссылку, иначе сборщик мусора уберёт
-        set_long(hwnd, GWLP_WNDPROC, ctypes.cast(widget._wpm_drop_proc, ctypes.c_void_p))
+        cb = WNDPROC(proc)
+        _KEEP.append(cb)                         # держим ссылку до конца процесса
+        widget._wpm_drop_proc = cb
+        set_long(hwnd, GWLP_WNDPROC, ctypes.cast(cb, ctypes.c_void_p))
         shell32.DragAcceptFiles(hwnd, True)
         log.info("Перетаскивание папок в окно включено")
         return True

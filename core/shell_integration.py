@@ -40,10 +40,63 @@ def register(exe=None):
             with winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"{base}\\{KEY}\\command") as k:
                 winreg.SetValueEx(k, None, 0, winreg.REG_SZ, command_for(exe, ph))
         _delete(OLD_TARGETS)
-        return True
+        log.info("Пункт «%s» добавлен в меню Проводника (%s)", LABEL, exe)
+        ok = True
     except OSError:
         log.exception("Не удалось добавить пункт в меню Проводника")
+        ok = False
+    # Запасной путь, если реестр заблокирован политикой: «Отправить → WPM — напечатать»
+    make_sendto(exe)
+    return ok
+
+
+SENDTO_NAME = "WPM — напечатать.lnk"
+
+
+def sendto_path():
+    import os
+    return os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\SendTo", SENDTO_NAME)
+
+
+def make_sendto(exe=None):
+    """Ярлык в «Отправить»: выделенные файлы/папки придут как WPM.exe --print путь1 путь2…"""
+    if sys.platform != "win32":
         return False
+    exe = exe or sys.executable
+    try:
+        import win32com.client
+        sh = win32com.client.Dispatch("WScript.Shell")
+        lnk = sh.CreateShortcut(sendto_path())
+        lnk.TargetPath = exe
+        lnk.Arguments = "--print"
+        lnk.IconLocation = f"{exe},0"
+        lnk.Description = "Напечатать в WellEnergy Print Manager"
+        lnk.Save()
+        return True
+    except Exception:
+        log.exception("Не удалось создать ярлык в «Отправить»")
+        return False
+
+
+def check():
+    """Что сейчас есть в системе — для кнопки «Проверить» в настройках."""
+    res = {"registry": {}, "sendto": False, "command": ""}
+    if sys.platform != "win32":
+        return res
+    import os
+    try:
+        import winreg
+        for base, _ph in TARGETS:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{base}\\{KEY}\\command") as k:
+                    res["command"] = winreg.QueryValueEx(k, None)[0]
+                    res["registry"][base] = True
+            except OSError:
+                res["registry"][base] = False
+    except ImportError:
+        pass
+    res["sendto"] = os.path.exists(sendto_path())
+    return res
 
 
 def _delete(bases):
@@ -60,11 +113,30 @@ def unregister():
     if sys.platform != "win32":
         return False
     try:
+        import os
+        try:
+            os.remove(sendto_path())
+        except OSError:
+            pass
         _delete([b for b, _ph in TARGETS] + OLD_TARGETS)
         return True
     except OSError:
         log.exception("Не удалось убрать пункт из меню Проводника")
         return False
+
+
+def parse_print_args(argv):
+    """Все пути после --print (из «Отправить» их может быть много) → список."""
+    out = []
+    for i, a in enumerate(argv):
+        if a.startswith("--print="):
+            out.append(a.split("=", 1)[1])
+        elif a == "--print":
+            for b in argv[i + 1:]:
+                if b.startswith("--"):
+                    break
+                out.append(b)
+    return out
 
 
 def parse_print_arg(argv):

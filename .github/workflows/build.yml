@@ -88,10 +88,17 @@ jobs:
       - name: Самопроверка собранного exe (окна, анализ, отмена — без зависаний)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Continue"
           $p = Start-Process -FilePath "dist/WPM.exe" -ArgumentList "--self-test=selftest.txt" -PassThru
-          if (-not $p.WaitForExit(180000)) { $p.Kill(); Write-Error "exe завис в самопроверке"; exit 1 }
-          Get-Content selftest.txt -Encoding UTF8
-          if ($p.ExitCode -ne 0) { Write-Error "Самопроверка exe не пройдена"; exit 1 }
+          $hung = -not $p.WaitForExit(180000)
+          if ($hung) { $p.Kill() }
+          # Отчёт и журнал печатаем ВСЕГДА — чтобы по логу было видно, что именно не так
+          if (Test-Path selftest.txt) { Get-Content selftest.txt -Encoding UTF8 } else { Write-Host "selftest.txt не создан — exe упал до конца самопроверки" }
+          Get-ChildItem $env:TEMP -Directory -Filter "wpm_selftest_*" -ErrorAction SilentlyContinue | ForEach-Object {
+            Get-ChildItem $_.FullName -Recurse -Include print_manager.log, crash_native.log -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "===== $($_.FullName) ====="; Get-Content $_.FullName -Encoding UTF8 -Tail 120 } }
+          if ($hung) { Write-Host "::error::exe завис в самопроверке"; exit 1 }
+          if ($p.ExitCode -ne 0) { Write-Host "::error::Самопроверка exe не пройдена (код $($p.ExitCode)) — подробности в логе шага"; exit 1 }
 
       - name: Контрольная сумма
         shell: pwsh

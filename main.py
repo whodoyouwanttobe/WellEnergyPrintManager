@@ -56,8 +56,9 @@ if __name__ == "__main__":
         sys.exit(main_self_test(sys.argv[1:]))
     
     # «Напечатать в WPM» из меню Проводника: WPM.exe --print "C:\Папка" (или PDF)
-    from core.shell_integration import parse_print_arg
-    print_request = parse_print_arg(sys.argv[1:])
+    from core.shell_integration import parse_print_args
+    print_paths = parse_print_args(sys.argv[1:])
+    print_request = print_paths or None
 
     # Только один экземпляр: два одновременно запущенных WPM дважды анализируют папку
     # и могут дважды отправить одно и то же на печать.
@@ -70,7 +71,8 @@ if __name__ == "__main__":
                 if print_request:
                     # Программа уже открыта — передаём ей путь, она сама покажет окно печати
                     from core.print_request import write_request
-                    write_request(print_request)
+                    for _p in print_paths:
+                        write_request(_p)
                     sys.exit(0)
                 import tkinter as _tk
                 from tkinter import messagebox as _mb

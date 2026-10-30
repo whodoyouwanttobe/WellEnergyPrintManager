@@ -83,7 +83,9 @@ class SettingsDialog(tk.Toplevel):
 
         self.explorer_var = ctk.BooleanVar(master=self, value=bool(self.cfg.get("explorer_menu", True)))
         ctk.CTkCheckBox(self.tab_general, text="Пункт «Напечатать в WPM» в меню Проводника (правый клик по папке/PDF)",
-                        variable=self.explorer_var).grid(row=5, column=0, columnspan=2, padx=10, pady=(4, 2), sticky="w")
+                        variable=self.explorer_var).grid(row=5, column=0, padx=10, pady=(4, 2), sticky="w")
+        ctk.CTkButton(self.tab_general, text="Проверить / добавить", width=150,
+                      command=self._check_explorer_menu).grid(row=5, column=1, padx=10, pady=(4, 2), sticky="e")
         ctk.CTkLabel(self.tab_general, text="В Windows 11 пункт — в «Показать дополнительные параметры» "
                      "(или Shift + правый клик).", font=("Segoe UI", 10), text_color="gray").grid(
             row=6, column=0, columnspan=2, padx=10, pady=(0, 8), sticky="w")
@@ -233,6 +235,29 @@ class SettingsDialog(tk.Toplevel):
         self.cfg.data["bug_token"] = self.entry_bug_token.get().strip()
         self.cfg.data["tg_token"] = self.entry_tg_token.get().strip()
         self.cfg.data["tg_chat_id"] = self.entry_tg_chat.get().strip()
+
+    def _check_explorer_menu(self):
+        import sys
+        from core import shell_integration as si
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo("Меню Проводника", "Пункт добавляется только в собранной программе (WPM.exe).", parent=self)
+            return
+        si.register()
+        r = si.check()
+        names = {r"Software\Classes\Directory\shell": "у папок",
+                 r"Software\Classes\Directory\Background\shell": "внутри папки (пустое место)",
+                 r"Software\Classes\SystemFileAssociations\.pdf\shell": "у PDF"}
+        lines = [("✓ " if ok else "✗ ") + names.get(b, b) for b, ok in r["registry"].items()]
+        lines.append(("✓ " if r["sendto"] else "✗ ") + "«Отправить → WPM — напечатать» (запасной вариант)")
+        txt = "Пункт «Напечатать в WPM»:\n" + "\n".join(lines)
+        if r["command"]:
+            txt += f"\n\nКоманда: {r['command']}"
+        if not all(r["registry"].values()):
+            txt += ("\n\nВ реестр записать не удалось — вероятно, это запрещено политикой компьютера. "
+                    "Пользуйтесь «Отправить → WPM — напечатать».")
+        else:
+            txt += "\n\nЕсли пункта всё равно не видно — закройте и откройте окно Проводника."
+        messagebox.showinfo("Меню Проводника", txt, parent=self)
 
     def _build_printers_tab(self):
         """Опрос принтеров по сети (SNMP): замятие, бумага, чернила по цветам, «печатает»."""

@@ -27,7 +27,8 @@ def prepare_environment(tmp_dir):
     """Вызывать ДО импорта core.config: подменяем APPDATA на временную папку."""
     os.environ["APPDATA"] = tmp_dir
     os.environ["WPM_DATA_DIR"] = os.path.join(tmp_dir, "WellEnergyPrintManager")
-    os.environ["WPM_NO_TOUR"] = "1"   # обучение проверяем отдельно, без автопредложения
+    os.environ["WPM_NO_TOUR"] = "1"
+    os.environ["WPM_SELFTEST"] = "1"     # не трогать реестр/меню Проводника и окно Windows   # обучение проверяем отдельно, без автопредложения
     os.makedirs(os.path.join(tmp_dir, "WellEnergyPrintManager"), exist_ok=True)
 
 
